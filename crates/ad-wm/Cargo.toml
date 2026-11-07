@@ -1,0 +1,16 @@
+[package]
+name = "ad-wm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "agent-desktop 窗口模型/布局/输入映射/截图编码"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ad-ipc = { path = "../ad-ipc" }
+smithay = { workspace = true }
+xkbcommon = { workspace = true }
+image = { workspace = true }

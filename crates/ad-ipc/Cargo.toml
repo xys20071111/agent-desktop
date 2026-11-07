@@ -1,0 +1,13 @@
+[package]
+name = "ad-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "agent-desktop 控制平面：JSON-RPC over UDS 的协议与传输"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+calloop = { workspace = true }
