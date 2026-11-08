@@ -1,0 +1,5 @@
+Io error: Connection reset by peer (os error 104)
+
+thread 'main' (1670319) panicked at crates/agentdesk/src/bin/ad-test-client.rs:108:66:
+dispatch 失败: OtherError(IoError(Os { code: 104, kind: ConnectionReset, message: "Connection reset by peer" }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

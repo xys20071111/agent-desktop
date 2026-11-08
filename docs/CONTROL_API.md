@@ -85,8 +85,8 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 | `windows.focus` | `{"id":7}` | `{"ok":true}` |
 | `windows.raise` | `{"id":7}` | `{"ok":true}` |
 | `windows.set_geometry` | `{"id":7,"x":40,"y":40,"width":1024,"height":768}`（均可部分省略） | `{"ok":true}` |
-| `windows.minimize` / `windows.restore` | `{"id":7}` | `{"ok":true}` |
-| `windows.set_fullscreen` | `{"id":7,"enabled":true}` | `{"ok":true}` |
+| `windows.minimize` / `windows.restore` | `{"id":7}` | `{"ok":true}` ⏳ 未实现（v1.1） |
+| `windows.set_fullscreen` | `{"id":7,"enabled":true}` | `{"ok":true}` ⏳ 未实现（v1.1） |
 
 `windows.launch`：子进程环境自动注入 `WAYLAND_DISPLAY=agentdesk-<instance>`；`x11:true` 时改为注入 `DISPLAY=:<n>`（satellite 未运行则先拉起）。`wait_for_window_ms` 内出现该 pid 的窗口则回填 `window_id`，否则为 `null`（进程仍已启动）。
 
@@ -166,7 +166,7 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 | `layout.tile` | `{"output":"HEADLESS-1","direction":"grid","padding":8}` | 一次性网格排列 |
 | `layout.cascade` | `{"output":"HEADLESS-1","offset":32}` | 一次性级联排列 |
 
-### 3.7 clipboard（v1.1）
+### 3.7 clipboard ⏳ 未实现（v1.1，协议已定义）
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
@@ -205,7 +205,7 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 
 节流策略：`window.updated` 中 geometry 连续变化按 ~16ms 合并；其余立即推送。
 
-## 5. `via_fd` 图像传输
+## 5. `via_fd` 图像传输 ⏳ 未实现（v1.1；当前请求会返回 invalid_params，请用 base64/to_path）
 
 请求带 `"via_fd":true` 时，合成器创建 memfd（或 `to_path` 语义下的普通文件不适用此模式），图像写入后 fd 以 SCM_RIGHTS 附加在响应帧之后。客户端按"读一行 JSON → 立即 recvmsg 收 fd"处理。此模式避免大图 base64 的 ~33% 膨胀，适合高频截图。
 

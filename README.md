@@ -9,6 +9,7 @@
 
 ## 文档
 
+- [SKILL.md](SKILL.md)——**Agent 使用技能卡**：给其他 AI Agent 的实操指南（工作流/守则/陷阱/Python 示例）
 - [设计文档](docs/DESIGN.md)——架构、关键决策、子系统设计、实现落地注记
 - [控制协议规范](docs/CONTROL_API.md)——JSON-RPC 方法/事件/错误码全集与 adctl 用法
 
