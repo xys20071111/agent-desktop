@@ -22,9 +22,13 @@ BIN=target/release
 
 ```bash
 $BIN/agentdesk --instance main --print-info &      # 无头启动；stdout 打一行 JSON（含 socket 路径）
+$BIN/agentdesk --instance main --daemon            # 守护进程模式：脱离终端、日志/PID 落盘，
+                                                   # 父进程等就绪后退出并打印 {"daemon":true,"pid":...}
 ```
 
 - **socket 发现**：`$AGENTDESK_SOCKET` → 否则 `$XDG_RUNTIME_DIR/agentdesk/<instance>.sock`
+- 守护进程模式下日志/PID 与 socket 同名：`main.log` / `main.pid`（`--daemon-log` 可改）；
+  `agdctl shutdown` 对前台/守护进程通用，PID 文件随退出清理
 - 权限 0600，仅同用户可用；多实例用 `--instance` 隔离（socket 与 Wayland socket 名均独立）
 - 关闭：`$BIN/adctl shutdown`（优雅退出，socket 文件自动清理）
 

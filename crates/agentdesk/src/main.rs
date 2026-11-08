@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use calloop::timer::{TimeoutAction, Timer};
 use clap::Parser;
 use smithay::reexports::wayland_server::Display;
@@ -36,6 +37,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let is_daemon_child = std::env::var_os("AGENTDESK_DAEMON_CHILD").is_some();
+    if config.daemon && !is_daemon_child {
+        // 父进程：拉起守护子进程、等就绪、打印 JSON、退出
+        return match spawn_daemon(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("agentdesk: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -47,6 +59,68 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--daemon`：以自身重新 exec 的方式脱离终端（独立进程组、stdio 重定向到日志）。
+/// 父进程轮询"控制 socket 可连接"作为就绪信号（stale socket 文件不会误报），然后退出。
+fn spawn_daemon(config: &Config) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let log_path = config.log_path();
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args_os().skip(1))
+        .env("AGENTDESK_DAEMON_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    // 独立进程组：终端关闭的 SIGHUP 不会送达
+    cmd.process_group(0);
+    let mut child = cmd.spawn().context("daemon 进程拉起失败")?;
+    let pid = child.id();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "daemon 启动失败（exit {status}）。日志尾部:\n{}",
+                log_tail(&log_path, 5)
+            );
+        }
+        // connect 成功 = IPC 监听已建立（stale socket 文件在此处会连接失败，不会误报）
+        if ad_ipc::client::Client::connect(&config.socket_path).is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("daemon 未在时限内就绪，已终止；日志: {}", log_path.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "daemon": true,
+            "pid": pid,
+            "socket": config.socket_path.display().to_string(),
+            "wayland_display": config.wayland_socket_name,
+            "log": log_path.display().to_string(),
+        })
+    );
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+fn log_tail(path: &std::path::Path, n: usize) -> String {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 fn run(config: Config) -> anyhow::Result<()> {
@@ -120,6 +194,10 @@ fn run(config: Config) -> anyhow::Result<()> {
         let _ = std::io::stdout().flush();
     }
 
+    if config.daemon {
+        std::fs::write(config.pid_path(), std::process::id().to_string())?;
+    }
+
     tracing::info!(
         instance = %config.instance,
         wayland_display = %config.wayland_socket_name,
@@ -134,6 +212,9 @@ fn run(config: Config) -> anyhow::Result<()> {
         let _ = display.flush_clients();
     });
     ipc_handle.shutdown();
+    if config.daemon {
+        let _ = std::fs::remove_file(config.pid_path());
+    }
     tracing::info!("agentdesk 已退出");
     result.map_err(|e| anyhow::anyhow!("事件循环错误: {e}"))
 }

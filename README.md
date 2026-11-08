@@ -27,6 +27,10 @@ cargo build --release
 ./target/release/agentdesk --instance main --print-info &   # 无头启动
 export AGENTDESK_SOCKET=/run/user/$UID/agentdesk/main.sock
 
+# 或守护进程模式：脱离终端，日志/PID 落在 socket 旁（main.log / main.pid），
+# 父进程等控制面就绪后退出并打印 {"daemon":true,"pid":...}
+./target/release/agentdesk --instance main --daemon
+
 agdctl launch --wait 8000 -- firefox       # 拉起应用（自动连入 agentdesk）
 agdctl windows list                        # 窗口清单（JSON）
 agdctl tile                                # 网格布局
@@ -37,6 +41,7 @@ agdctl type "hello"                        # 注入文本
 agdctl show --size 1280x800                # 弹出嵌套预览窗口（热切换）
 agdctl hide                                # 收起预览
 agdctl watch                               # 订阅事件流
+agdctl shutdown                            # 停止（前台/守护进程通用）
 ```
 
 X11 应用：`agdctl launch --x11 --wait 8000 -- xterm`（自动拉起 `xwayland-satellite :100`）。

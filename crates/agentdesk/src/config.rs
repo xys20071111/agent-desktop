@@ -31,6 +31,14 @@ pub struct Cli {
     #[arg(long)]
     pub x11_display: Option<u32>,
 
+    /// 以守护进程模式运行：脱离终端、日志/PID 落盘（见 --daemon-log）
+    #[arg(short, long)]
+    pub daemon: bool,
+
+    /// 守护进程日志路径（默认 <socket 路径去掉扩展名>.log）
+    #[arg(long)]
+    pub daemon_log: Option<PathBuf>,
+
     /// 启动后向 stdout 打印一行 JSON（socket 路径等信息），便于脚本解析
     #[arg(long)]
     pub print_info: bool,
@@ -53,6 +61,8 @@ pub struct Config {
     pub renderer: RendererKind,
     pub token: Option<String>,
     pub print_info: bool,
+    pub daemon: bool,
+    pub daemon_log: Option<PathBuf>,
     pub x11_display: Option<u32>,
     /// 父会话类型（启动时探测）：wayland | x11 | None
     pub parent_session: Option<&'static str>,
@@ -90,9 +100,23 @@ impl Config {
             renderer,
             token: cli.token,
             print_info: cli.print_info,
+            daemon: cli.daemon,
+            daemon_log: cli.daemon_log,
             x11_display: cli.x11_display,
             parent_session,
         })
+    }
+
+    /// 守护进程日志路径（默认与 socket 同名、扩展名 .log）。
+    pub fn log_path(&self) -> PathBuf {
+        self.daemon_log
+            .clone()
+            .unwrap_or_else(|| self.socket_path.with_extension("log"))
+    }
+
+    /// 守护进程 PID 文件路径（默认与 socket 同名、扩展名 .pid）。
+    pub fn pid_path(&self) -> PathBuf {
+        self.socket_path.with_extension("pid")
     }
 }
 

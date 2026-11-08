@@ -422,6 +422,71 @@ fn e2e_launch_layout_outputs() {
 }
 
 #[test]
+fn e2e_daemon_mode() {
+    // 独立目录（与 E2e::start 一致的短路径，避免 SUN_LEN 超限）
+    let dir_raw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("e2e-daemon-{}", std::process::id()));
+    std::fs::create_dir_all(&dir_raw).expect("创建目录失败");
+    let dir = dir_raw.canonicalize().unwrap();
+
+    // --daemon：父进程拉起守护子进程，就绪后退出并打印 JSON
+    let mut parent = Command::new(env!("CARGO_BIN_EXE_agentdesk"))
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("RUST_LOG", "info")
+        .args(["--instance", "e2e", "--size", "640x480", "--daemon"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("启动 agentdesk --daemon 失败");
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match parent.try_wait().expect("wait 失败") {
+            Some(s) => break s,
+            None => {
+                assert!(Instant::now() < deadline, "daemon 父进程未按时退出");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    assert!(status.success(), "daemon 父进程异常退出: {status}");
+    let mut out = String::new();
+    parent
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let info: Value = serde_json::from_str(out.trim()).expect("父进程应打印 daemon JSON");
+    assert_eq!(info["daemon"], json!(true));
+    let pid = info["pid"].as_u64().expect("应返回 daemon pid");
+
+    // 控制平面可用
+    let sock = dir.join("agentdesk").join("e2e.sock");
+    let mut client = Client::connect(&sock).expect("连接失败");
+    client.call0("server.ping").expect("ping 失败");
+
+    // PID 文件存在且内容一致
+    let pidfile = dir.join("agentdesk").join("e2e.pid");
+    let file_pid: u64 = std::fs::read_to_string(&pidfile)
+        .expect("pid 文件应存在")
+        .trim()
+        .parse()
+        .expect("pid 文件内容应为数字");
+    assert_eq!(file_pid, pid);
+
+    // shutdown：socket 与 pid 文件都被清理
+    client.call0("server.shutdown").expect("shutdown 失败");
+    let deadline = Instant::now() + TIMEOUT;
+    while sock.exists() {
+        assert!(Instant::now() < deadline, "daemon 未按时退出");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!pidfile.exists(), "pid 文件应被清理");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn e2e_server_info() {
     let mut e2e = E2e::start("info");
     let info = e2e.call("server.info", json!({}));
