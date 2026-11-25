@@ -33,6 +33,10 @@ struct E2e {
 
 impl E2e {
     fn start(name: &str) -> E2e {
+        Self::start_with_args(name, &[])
+    }
+
+    fn start_with_args(name: &str, extra_args: &[&str]) -> E2e {
         // 每个测试独立目录（wayland socket 名虽同，但 XDG_RUNTIME_DIR 隔离）。
         // 注意 unix socket 路径上限 SUN_LEN=108：必须落在仓库根的 target/ 下，
         // 放在 crates/agentdesk/target 会超长。
@@ -52,28 +56,38 @@ impl E2e {
             // 显式移除父会话环境：验证无父会话分支（CI 环境即此形态）
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DISPLAY")
-            .args(["--instance", "e2e", "--size", "640x480"])
+            .args(["--instance", "e2e"])
+            .args(if extra_args.contains(&"--size") { Vec::new() } else { vec!["--size", "640x480"] })
+            .args(extra_args)
             .stderr(compositor_err)
             .spawn()
             .expect("启动 agentdesk 失败");
         let compositor = KillOnDrop(compositor);
 
         let control_sock = dir.join("agentdesk").join("e2e.sock");
+        let wayland_sock = dir.join("agentdesk-e2e");
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            if control_sock.exists() {
+            if control_sock.exists() && wayland_sock.exists() {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "等待控制 socket 超时：{}",
-                control_sock.display()
+                "等待控制/Wayland socket 超时：{} / {}",
+                control_sock.display(), wayland_sock.display()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
 
         let client = Client::connect(&control_sock).expect("连接控制 socket 失败");
-        E2e { dir, control_sock, compositor, client, _app: None, log_path }
+        E2e {
+            dir,
+            control_sock,
+            compositor,
+            client,
+            _app: None,
+            log_path,
+        }
     }
 
     fn call(&mut self, method: &str, params: Value) -> Value {
@@ -110,20 +124,27 @@ impl E2e {
     }
 
     fn launch_app(&mut self) {
+        let client_log = std::fs::File::create(self.dir.join("test-client.log")).expect("创建 test-client 日志失败");
         let app = Command::new(env!("CARGO_BIN_EXE_ad-test-client"))
             .env("XDG_RUNTIME_DIR", &self.dir)
             .env("WAYLAND_DISPLAY", "agentdesk-e2e")
             .env("RUST_LOG", "warn")
             .args([
-                "--color", "ff0000",
-                "--alt-color", "00ff00",
-                "--title", "E2E Window",
-                "--app-id", "ad.test.client",
-                "--width", "320",
-                "--height", "240",
+                "--color",
+                "ff0000",
+                "--alt-color",
+                "00ff00",
+                "--title",
+                "E2E Window",
+                "--app-id",
+                "ad.test.client",
+                "--width",
+                "320",
+                "--height",
+                "240",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(client_log)
             .spawn()
             .expect("启动 ad-test-client 失败");
         self._app = Some(KillOnDrop(app));
@@ -170,7 +191,11 @@ fn e2e_window_lifecycle() {
 
     // 初始无窗口
     let list = e2e.call("windows.list", json!({}));
-    assert_eq!(list["windows"].as_array().unwrap().len(), 0, "初始应为空桌面");
+    assert_eq!(
+        list["windows"].as_array().unwrap().len(),
+        0,
+        "初始应为空桌面"
+    );
 
     // 启动客户端 → window.created
     e2e.launch_app();
@@ -221,7 +246,14 @@ fn e2e_window_lifecycle() {
             .as_array()?
             .iter()
             .find(|w| w["id"] == window["id"])
-            .filter(|w| w["focused"] == true && w["states"].as_array().unwrap().iter().any(|s| s == "activated"))
+            .filter(|w| {
+                w["focused"] == true
+                    && w["states"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s == "activated")
+            })
             .cloned()
     });
     let _ = focused;
@@ -234,7 +266,11 @@ fn e2e_window_lifecycle() {
         _ => unreachable!(),
     }
     let list = e2e.call("windows.list", json!({}));
-    assert_eq!(list["windows"].as_array().unwrap().len(), 0, "关闭后桌面应为空");
+    assert_eq!(
+        list["windows"].as_array().unwrap().len(),
+        0,
+        "关闭后桌面应为空"
+    );
 
     // x11.status：无 satellite 时不可用
     let x11 = e2e.call("x11.status", json!({}));
@@ -317,7 +353,9 @@ fn e2e_input_injection() {
 fn raw_pixel(v: &Value, x: u64, y: u64) -> Option<[u8; 4]> {
     use base64::Engine as _;
     let data = v.get("data").and_then(Value::as_str)?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
     let w = v.get("width").and_then(Value::as_u64)?;
     let idx = ((y * w + x) * 4) as usize;
     let px: [u8; 4] = bytes.get(idx..idx + 4)?.try_into().ok()?;
@@ -338,7 +376,9 @@ fn e2e_screenshots() {
     // 等客户端首帧出现：整屏 (100,100)（窗口 32,32 起 320x240）应为红色（BGRA: B,G,R,A）
     e2e.wait_pixel(
         json!({ "format": "raw" }),
-        100, 100, [0, 0, 255, 255],
+        100,
+        100,
+        [0, 0, 255, 255],
         "首帧红色",
     );
 
@@ -346,19 +386,31 @@ fn e2e_screenshots() {
     let shot = e2e.call("windows.screenshot", json!({ "id": id, "format": "raw" }));
     assert_eq!(shot["width"], json!(320), "窗口截图宽度");
     assert_eq!(shot["height"], json!(240), "窗口截图高度");
-    assert_eq!(raw_pixel(&shot, 160, 120), Some([0, 0, 255, 255]), "窗口中心红色");
+    assert_eq!(
+        raw_pixel(&shot, 160, 120),
+        Some([0, 0, 255, 255]),
+        "窗口中心红色"
+    );
 
     // 点击窗口中心换色 → 整屏中心变绿（证明注入与渲染一致）
-    e2e.call("input.click", json!({ "x": 192.0, "y": 152.0, "button": "left" }));
+    e2e.call(
+        "input.click",
+        json!({ "x": 192.0, "y": 152.0, "button": "left" }),
+    );
     e2e.wait_pixel(
         json!({ "format": "raw" }),
-        100, 100, [0, 255, 0, 255],
+        100,
+        100,
+        [0, 255, 0, 255],
         "点击后绿色",
     );
 
     // png 编码可用
     let png = e2e.call("screen.capture", json!({ "format": "png" }));
-    assert!(png["data"].as_str().map(|d| d.len() > 100).unwrap_or(false), "png base64 应有内容");
+    assert!(
+        png["data"].as_str().map(|d| d.len() > 100).unwrap_or(false),
+        "png base64 应有内容"
+    );
 
     // jpeg 编码可用
     let jpeg = e2e.call("screen.capture", json!({ "format": "jpeg", "quality": 80 }));
@@ -393,9 +445,7 @@ fn e2e_launch_layout_outputs() {
             .as_array()?
             .iter()
             .find(|w| w["id"] == json!(id1))
-            .filter(|w| {
-                w["geometry"]["x"] == 8 && w["geometry"]["width"] == 308
-            })
+            .filter(|w| w["geometry"]["x"] == 8 && w["geometry"]["width"] == 308)
             .cloned()
     });
     let _ = e2e.wait_until("窗口2 网格右格", |list| {
@@ -403,14 +453,15 @@ fn e2e_launch_layout_outputs() {
             .as_array()?
             .iter()
             .find(|w| w["id"] == json!(id2))
-            .filter(|w| {
-                w["geometry"]["x"] == 324 && w["geometry"]["width"] == 308
-            })
+            .filter(|w| w["geometry"]["x"] == 324 && w["geometry"]["width"] == 308)
             .cloned()
     });
 
     // outputs 增删
-    let created = e2e.call("outputs.create", json!({ "width": 640, "height": 480, "name": "HEADLESS-2" }));
+    let created = e2e.call(
+        "outputs.create",
+        json!({ "width": 640, "height": 480, "name": "HEADLESS-2" }),
+    );
     assert_eq!(created["id"], "HEADLESS-2");
     let list = e2e.call("outputs.list", json!({}));
     assert_eq!(list["outputs"].as_array().unwrap().len(), 2);
@@ -418,6 +469,148 @@ fn e2e_launch_layout_outputs() {
     let list = e2e.call("outputs.list", json!({}));
     assert_eq!(list["outputs"].as_array().unwrap().len(), 1);
 
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_launch_security_policies() {
+    let denied = E2e::start_with_args("deny-launch", &["--deny-launch"]);
+    let mut denied = denied;
+    let result = denied.client.call("windows.launch", json!({"argv":["/bin/true"]}));
+    assert!(result.is_err(), "--deny-launch must reject windows.launch");
+    assert!(result.unwrap_err().to_string().contains("-32007"));
+    denied.shutdown();
+
+    let allowlist_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!("agentdesk-allowlist-{}", std::process::id()));
+    std::fs::write(&allowlist_path, "# only this executable is allowed\n/bin/true\n").expect("write allowlist");
+    let allowlist_string = allowlist_path.to_str().unwrap();
+    let mut allowed = E2e::start_with_args("allow-launch", &["--launch-allowlist", allowlist_string]);
+    let launch = allowed.call("windows.launch", json!({"argv":["/bin/true"]}));
+    assert!(launch["pid"].as_u64().unwrap() > 0, "allowlisted executable should launch");
+    let rejected = allowed.client.call("windows.launch", json!({"argv":["/bin/false"]}));
+    assert!(rejected.is_err(), "not-listed executable must be rejected");
+    std::fs::remove_file(&allowlist_path).expect("remove allowlist");
+    allowed.shutdown();
+}
+
+#[test]
+fn e2e_token_authentication_strikes_and_success() {
+    let mut protected = E2e::start_with_args("token-valid", &["--token", "test-secret"]);
+    assert!(protected.client.call("server.ping", json!({})).is_err());
+    protected.call("auth", json!({"token":"test-secret"}));
+    assert_eq!(protected.call("server.ping", json!({})) ["pong"], true);
+    protected.shutdown();
+
+    let mut locked = E2e::start_with_args("token-invalid", &["--token", "test-secret"]);
+    for attempt in 0..3 {
+        let result = locked.client.call("auth", json!({"token":"wrong"}));
+        assert!(result.is_err(), "invalid auth attempt {} must fail", attempt + 1);
+    }
+    assert!(locked.client.call("server.ping", json!({})).is_err(), "third auth failure closes the connection");
+    let mut admin = Client::connect(&locked.control_sock).expect("reconnect for cleanup");
+    admin.call("auth", json!({"token":"test-secret"})).expect("cleanup auth");
+    admin.call0("server.shutdown").expect("cleanup shutdown");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while locked.compositor.0.try_wait().expect("wait compositor").is_none() {
+        assert!(Instant::now() < deadline, "protected compositor did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&locked.dir);
+}
+
+#[test]
+fn e2e_capture_size_limit() {
+    let mut e2e = E2e::start_with_args("capture-too-large", &["--size", "8192x8192"]);
+    let result = e2e.client.call("screen.capture", json!({"format":"raw"}));
+    assert!(result.unwrap_err().to_string().contains("资源限制"));
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_event_subscription_allowlist() {
+    let mut e2e = E2e::start("event-allowlist");
+    e2e.call("events.subscribe", json!({"types":["window.*", "frames.frame"]}));
+    assert!(e2e.client.call("events.subscribe", json!({"types":["secret.internal"]})).is_err());
+    let too_many = vec!["window.created"; 17];
+    assert!(e2e.client.call("events.subscribe", json!({"types":too_many})).is_err());
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_capture_output_dir_policy() {
+    let capture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!("capture-allow-{}", std::process::id()));
+    std::fs::create_dir_all(&capture_dir).expect("create capture directory");
+    let capture_dir_str = capture_dir.to_str().unwrap();
+    let mut e2e = E2e::start_with_args("capture-policy", &["--capture-output-dir", capture_dir_str]);
+    let allowed_path = capture_dir.join("allowed.raw");
+    let result = e2e.call("screen.capture", json!({"format":"raw", "to_path":allowed_path}));
+    assert_eq!(result["encoding"], "file");
+    assert_eq!(std::fs::metadata(&allowed_path).unwrap().len(), 640 * 480 * 4);
+
+    let denied_path = capture_dir.parent().unwrap().join(format!("capture-denied-{}.raw", std::process::id()));
+    let denied = e2e.client.call("screen.capture", json!({"format":"raw", "to_path":denied_path}));
+    assert!(denied.is_err(), "paths outside configured directory must be denied");
+    assert!(!denied_path.exists());
+
+    let victim = capture_dir.parent().unwrap().join(format!("capture-victim-{}.txt", std::process::id()));
+    std::fs::write(&victim, b"must remain untouched").expect("create outside victim");
+    let symlink_target = capture_dir.join("escape-link.raw");
+    std::os::unix::fs::symlink(&victim, &symlink_target).expect("create screenshot symlink");
+    let escaped = e2e.client.call("screen.capture", json!({"format":"raw", "to_path":symlink_target}));
+    assert!(escaped.is_err(), "symlink target outside output directory must be rejected");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"must remain untouched");
+    assert!(std::fs::symlink_metadata(&symlink_target).unwrap().file_type().is_symlink());
+    e2e.shutdown();
+    std::fs::remove_dir_all(&capture_dir).expect("remove capture directory");
+    std::fs::remove_file(&victim).expect("remove capture victim");
+}
+
+#[test]
+fn e2e_glow_renderer_initializes_surfaceless_egl() {
+    let mut e2e = E2e::start_with_args("glow-init", &["--renderer", "glow"]);
+    let info = e2e.call("server.info", json!({}));
+    assert_eq!(info["renderer"], "glow");
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_glow_headless_screenshot_pixels() {
+    let mut e2e = E2e::start_with_args("glow-capture", &["--renderer", "glow"]);
+    e2e.launch_app();
+    let _ = e2e.wait_until("Glow Wayland 窗口映射", |list| {
+        list["windows"].as_array()?.iter().find(|window| window["app_id"] == "ad.test.client").cloned()
+    });
+    e2e.wait_pixel(json!({"format":"raw"}), 100, 100, [0, 0, 255, 255], "Glow 窗口像素");
+    let frame = e2e.call("screen.capture", json!({"format":"raw"}));
+    assert_eq!(frame["width"], 640);
+    assert_eq!(frame["height"], 480);
+    assert_eq!(raw_pixel(&frame, 100, 100), Some([0, 0, 255, 255]), "Glow window-content pixels");
+    let info = e2e.call("server.info", json!({}));
+    assert_eq!(info["renderer"], "glow");
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_frames_subscribe_and_unsubscribe() {
+    let mut e2e = E2e::start("frames-subscription");
+    let started = e2e.call("frames.subscribe", json!({"fps":10,"output":"HEADLESS-1"}));
+    let subscription_id = started["subscription_id"].as_u64().expect("subscription id");
+    assert_eq!(started["format"], "jpeg");
+    let event = e2e.wait_event("frames.frame");
+    match event {
+        Event::FramesFrame { subscription_id: id, frame } => {
+            assert_eq!(id, subscription_id);
+            assert_eq!(frame.encoding, ad_ipc::protocol::ImageEncoding::Base64);
+            assert_eq!(frame.format, "jpeg");
+            assert!(frame.data.as_ref().is_some_and(|data| data.len() > 100));
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    // Drain anything already queued before checking that unsubscribe stops future frames.
+    while e2e.client.try_next_event(Duration::from_millis(10)).expect("drain frames").is_some() {}
+    e2e.call("frames.unsubscribe", json!({"subscription_id":subscription_id}));
+    while e2e.client.try_next_event(Duration::from_millis(10)).expect("drain final in-flight frame").is_some() {}
+    assert!(e2e.client.try_next_event(Duration::from_millis(250)).expect("post unsubscribe poll").is_none());
     e2e.shutdown();
 }
 
@@ -496,6 +689,89 @@ fn e2e_server_info() {
     assert_eq!(info["outputs"][0]["id"], "HEADLESS-1");
     assert_eq!(info["outputs"][0]["width"], 640);
     assert_eq!(info["outputs"][0]["height"], 480);
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_window_visibility_states() {
+    let mut e2e = E2e::start("visibility-states");
+    e2e.launch_app();
+    let list = e2e.wait_until("窗口创建", |v| {
+        v["windows"].as_array()?.first().cloned()
+    });
+    let id = list["id"].as_u64().unwrap();
+    e2e.call("windows.minimize", json!({"id": id}));
+    assert_eq!(
+        e2e.call("windows.get", json!({"id": id}))["states"],
+        json!(["minimized"])
+    );
+    let frame = e2e.call("screen.capture", json!({"format":"raw"}));
+    assert_eq!(raw_pixel(&frame, 100, 100), Some([30, 25, 25, 255]));
+    e2e.call("windows.restore", json!({"id": id}));
+    let restored = e2e.call("windows.get", json!({"id": id}));
+    assert!(!restored["states"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("minimized")));
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_clipboard_compositor_selection() {
+    let mut e2e = E2e::start("clipboard");
+    assert_eq!(
+        e2e.call("clipboard.get", json!({"which":"regular"}))["text"],
+        Value::Null
+    );
+    assert_eq!(
+        e2e.call("server.ping", json!({}))["pong"],
+        true,
+        "clipboard.get must leave the main loop responsive"
+    );
+    e2e.call("clipboard.set", json!({"text":"agent clipboard ✓"}));
+    assert_eq!(
+        e2e.call("clipboard.get", json!({"which":"regular"}))["text"],
+        "agent clipboard ✓"
+    );
+    assert_eq!(
+        e2e.call("clipboard.get", json!({"which":"primary"}))["text"],
+        "agent clipboard ✓"
+    );
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_clipboard_client_selection_read() {
+    let mut e2e = E2e::start("clipboard-client-source");
+    let app = Command::new(env!("CARGO_BIN_EXE_ad-test-client"))
+        .env("XDG_RUNTIME_DIR", &e2e.dir)
+        .env("WAYLAND_DISPLAY", "agentdesk-e2e")
+        .args(["--title", "Clipboard source", "--app-id", "ad.test.clipboard", "--clipboard-text", "copied from wayland client ✓"])
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("启动剪贴板测试客户端失败");
+    e2e._app = Some(KillOnDrop(app));
+    let win = e2e.wait_until("剪贴板客户端窗口创建", |v| v["windows"].as_array()?.iter().find(|w| w["app_id"] == "ad.test.clipboard").cloned());
+    let id = win["id"].as_u64().unwrap();
+    e2e.call("windows.focus", json!({"id":id}));
+    let _ = e2e.wait_until("客户端发布剪贴板 selection", |v| v["windows"].as_array()?.iter().find(|w| w["id"] == id && w["title"] == "clipboard-source-ready").cloned());
+    let result = e2e.call("clipboard.get", json!({"which":"regular"}));
+    assert_eq!(result["text"], "copied from wayland client ✓");
+    e2e.shutdown();
+}
+
+#[test]
+fn e2e_screenshot_via_fd() {
+    use std::io::Read as _;
+    let mut e2e = E2e::start("capture-fd");
+    e2e.launch_app();
+    let _ = e2e.wait_until("窗口出现", |v| v["windows"].as_array()?.first().cloned());
+    let (metadata, fd) = e2e.client.call_with_fd("screen.capture", json!({"format":"raw", "via_fd":true})).expect("SCM_RIGHTS 截图请求失败");
+    assert_eq!(metadata["encoding"], "fd");
+    let fd = fd.expect("响应中应附带截图 fd");
+    let mut image = std::fs::File::from(fd);
+    let mut bytes = Vec::new();
+    image.read_to_end(&mut bytes).expect("读取截图 fd 失败");
+    assert_eq!(bytes.len(), 640 * 480 * 4);
+    assert_eq!(&bytes[..4], &[30, 25, 25, 255]);
     e2e.shutdown();
 }
 

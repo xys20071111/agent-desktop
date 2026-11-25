@@ -26,3 +26,4 @@ smithay = { workspace = true }
 smithay-client-toolkit = { workspace = true }
 xkbcommon = { workspace = true }
 image = { workspace = true }
+libc = { workspace = true }

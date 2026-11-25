@@ -214,19 +214,41 @@ pub enum MethodCall {
     ServerInfo,
     ServerPing,
     ServerShutdown,
-    Auth { token: String },
+    Auth {
+        token: String,
+    },
 
-    WindowsList { filter: Option<WindowFilter> },
-    WindowsGet { id: u64 },
-    WindowsClose { id: u64 },
-    WindowsFocus { id: u64 },
-    WindowsRaise { id: u64 },
+    WindowsList {
+        filter: Option<WindowFilter>,
+    },
+    WindowsGet {
+        id: u64,
+    },
+    WindowsClose {
+        id: u64,
+    },
+    WindowsFocus {
+        id: u64,
+    },
+    WindowsRaise {
+        id: u64,
+    },
     WindowsSetGeometry {
         id: u64,
         x: Option<i32>,
         y: Option<i32>,
         width: Option<i32>,
         height: Option<i32>,
+    },
+    WindowsMinimize {
+        id: u64,
+    },
+    WindowsRestore {
+        id: u64,
+    },
+    WindowsSetFullscreen {
+        id: u64,
+        enabled: bool,
     },
     WindowsLaunch {
         argv: Vec<String>,
@@ -240,11 +262,25 @@ pub enum MethodCall {
         output: Option<String>,
         opts: CaptureOptions,
     },
-    WindowsScreenshot { id: u64, opts: CaptureOptions },
+    WindowsScreenshot {
+        id: u64,
+        opts: CaptureOptions,
+    },
+    FramesSubscribe { output: Option<String>, fps: Option<u32> },
+    FramesUnsubscribe { subscription_id: u64 },
 
-    InputMoveCursor { x: f64, y: f64 },
-    InputMoveRelative { dx: f64, dy: f64 },
-    InputButton { button: String, action: String },
+    InputMoveCursor {
+        x: f64,
+        y: f64,
+    },
+    InputMoveRelative {
+        dx: f64,
+        dy: f64,
+    },
+    InputButton {
+        button: String,
+        action: String,
+    },
     InputClick {
         x: Option<f64>,
         y: Option<f64>,
@@ -257,9 +293,18 @@ pub enum MethodCall {
         x: Option<f64>,
         y: Option<f64>,
     },
-    InputKey { key: String, action: Option<String> },
-    InputCombo { keys: Vec<String>, hold_ms: Option<u64> },
-    InputTypeText { text: String, delay_ms_per_key: Option<u64> },
+    InputKey {
+        key: String,
+        action: Option<String>,
+    },
+    InputCombo {
+        keys: Vec<String>,
+        hold_ms: Option<u64>,
+    },
+    InputTypeText {
+        text: String,
+        delay_ms_per_key: Option<u64>,
+    },
     InputGetCursor,
 
     DisplayShow {
@@ -273,16 +318,37 @@ pub enum MethodCall {
     DisplayStatus,
 
     OutputsList,
-    OutputsCreate { width: i32, height: i32, name: Option<String> },
-    OutputsDestroy { id: String },
-    LayoutTile { output: Option<String>, direction: Option<String>, padding: Option<i32> },
-    LayoutCascade { output: Option<String>, offset: Option<i32> },
+    OutputsCreate {
+        width: i32,
+        height: i32,
+        name: Option<String>,
+    },
+    OutputsDestroy {
+        id: String,
+    },
+    LayoutTile {
+        output: Option<String>,
+        direction: Option<String>,
+        padding: Option<i32>,
+    },
+    LayoutCascade {
+        output: Option<String>,
+        offset: Option<i32>,
+    },
 
-    ClipboardGet { which: Option<String> },
-    ClipboardSet { text: String },
+    ClipboardGet {
+        which: Option<String>,
+    },
+    ClipboardSet {
+        text: String,
+    },
 
-    EventsSubscribe { types: Vec<String> },
-    EventsUnsubscribe { subscription_id: u64 },
+    EventsSubscribe {
+        types: Vec<String>,
+    },
+    EventsUnsubscribe {
+        subscription_id: u64,
+    },
 
     X11Status,
 }
@@ -301,25 +367,48 @@ impl MethodCall {
             "server.info" => MethodCall::ServerInfo,
             "server.ping" => MethodCall::ServerPing,
             "server.shutdown" => MethodCall::ServerShutdown,
-            "auth" => MethodCall::Auth { token: req_string(m, "token")? },
+            "auth" => MethodCall::Auth {
+                token: req_string(m, "token")?,
+            },
 
             "windows.list" => MethodCall::WindowsList {
                 filter: match m.get("filter") {
                     Some(Value::Null) | None => None,
-                    Some(v) => Some(serde_json::from_value(v.clone())
-                        .map_err(|e| RpcError::invalid_params(format!("filter: {e}")))?),
+                    Some(v) => Some(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| RpcError::invalid_params(format!("filter: {e}")))?,
+                    ),
                 },
             },
-            "windows.get" => MethodCall::WindowsGet { id: req_u64(m, "id")? },
-            "windows.close" => MethodCall::WindowsClose { id: req_u64(m, "id")? },
-            "windows.focus" => MethodCall::WindowsFocus { id: req_u64(m, "id")? },
-            "windows.raise" => MethodCall::WindowsRaise { id: req_u64(m, "id")? },
+            "windows.get" => MethodCall::WindowsGet {
+                id: req_u64(m, "id")?,
+            },
+            "windows.close" => MethodCall::WindowsClose {
+                id: req_u64(m, "id")?,
+            },
+            "windows.focus" => MethodCall::WindowsFocus {
+                id: req_u64(m, "id")?,
+            },
+            "windows.raise" => MethodCall::WindowsRaise {
+                id: req_u64(m, "id")?,
+            },
             "windows.set_geometry" => MethodCall::WindowsSetGeometry {
                 id: req_u64(m, "id")?,
                 x: opt_i32(m, "x")?,
                 y: opt_i32(m, "y")?,
                 width: opt_i32(m, "width")?,
                 height: opt_i32(m, "height")?,
+            },
+            "windows.minimize" => MethodCall::WindowsMinimize {
+                id: req_u64(m, "id")?,
+            },
+            "windows.restore" => MethodCall::WindowsRestore {
+                id: req_u64(m, "id")?,
+            },
+            "windows.set_fullscreen" => MethodCall::WindowsSetFullscreen {
+                id: req_u64(m, "id")?,
+                enabled: opt_bool(m, "enabled")?
+                    .ok_or_else(|| RpcError::invalid_params("缺少字段 enabled"))?,
             },
             "windows.launch" => MethodCall::WindowsLaunch {
                 argv: req_string_vec(m, "argv")?,
@@ -337,6 +426,11 @@ impl MethodCall {
                 id: req_u64(m, "id")?,
                 opts: parse_capture(m)?,
             },
+            "frames.subscribe" => MethodCall::FramesSubscribe {
+                output: opt_string(m, "output")?,
+                fps: opt_u32(m, "fps")?,
+            },
+            "frames.unsubscribe" => MethodCall::FramesUnsubscribe { subscription_id: req_u64(m, "subscription_id")? },
 
             "input.move_cursor" => MethodCall::InputMoveCursor {
                 x: req_f64(m, "x")?,
@@ -392,7 +486,9 @@ impl MethodCall {
                 height: req_i32(m, "height")?,
                 name: opt_string(m, "name")?,
             },
-            "outputs.destroy" => MethodCall::OutputsDestroy { id: req_string(m, "id")? },
+            "outputs.destroy" => MethodCall::OutputsDestroy {
+                id: req_string(m, "id")?,
+            },
             "layout.tile" => MethodCall::LayoutTile {
                 output: opt_string(m, "output")?,
                 direction: opt_string(m, "direction")?,
@@ -403,11 +499,19 @@ impl MethodCall {
                 offset: opt_i32(m, "offset")?,
             },
 
-            "clipboard.get" => MethodCall::ClipboardGet { which: opt_string(m, "which")? },
-            "clipboard.set" => MethodCall::ClipboardSet { text: req_string(m, "text")? },
+            "clipboard.get" => MethodCall::ClipboardGet {
+                which: opt_string(m, "which")?,
+            },
+            "clipboard.set" => MethodCall::ClipboardSet {
+                text: req_string(m, "text")?,
+            },
 
-            "events.subscribe" => MethodCall::EventsSubscribe { types: req_string_vec(m, "types")? },
-            "events.unsubscribe" => MethodCall::EventsUnsubscribe { subscription_id: req_u64(m, "subscription_id")? },
+            "events.subscribe" => MethodCall::EventsSubscribe {
+                types: req_string_vec(m, "types")?,
+            },
+            "events.unsubscribe" => MethodCall::EventsUnsubscribe {
+                subscription_id: req_u64(m, "subscription_id")?,
+            },
 
             "x11.status" => MethodCall::X11Status,
 
@@ -481,7 +585,10 @@ fn req_string_vec(m: &serde_json::Map<String, Value>, k: &str) -> Result<Vec<Str
 fn opt_u64(m: &serde_json::Map<String, Value>, k: &str) -> Result<Option<u64>, RpcError> {
     match m.get(k) {
         Some(Value::Null) | None => Ok(None),
-        Some(v) => v.as_u64().map(Some).ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为非负整数"))),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为非负整数"))),
     }
 }
 
@@ -521,21 +628,31 @@ fn opt_i32(m: &serde_json::Map<String, Value>, k: &str) -> Result<Option<i32>, R
 fn opt_f64(m: &serde_json::Map<String, Value>, k: &str) -> Result<Option<f64>, RpcError> {
     match m.get(k) {
         Some(Value::Null) | None => Ok(None),
-        Some(v) => v.as_f64().map(Some).ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为数字"))),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为数字"))),
     }
 }
 
 fn opt_bool(m: &serde_json::Map<String, Value>, k: &str) -> Result<Option<bool>, RpcError> {
     match m.get(k) {
         Some(Value::Null) | None => Ok(None),
-        Some(v) => v.as_bool().map(Some).ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为布尔"))),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为布尔"))),
     }
 }
 
 fn opt_string(m: &serde_json::Map<String, Value>, k: &str) -> Result<Option<String>, RpcError> {
     match m.get(k) {
         Some(Value::Null) | None => Ok(None),
-        Some(v) => v.as_str().map(str::to_owned).map(Some).ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为字符串"))),
+        Some(v) => v
+            .as_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| RpcError::invalid_params(format!("字段 {k} 应为字符串"))),
     }
 }
 
@@ -548,7 +665,9 @@ fn opt_string_pairs(
         Some(Value::Object(obj)) => obj
             .iter()
             .map(|(k2, v)| {
-                let s = v.as_str().ok_or_else(|| RpcError::invalid_params(format!("env.{k2} 应为字符串")))?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| RpcError::invalid_params(format!("env.{k2} 应为字符串")))?;
                 Ok((k2.clone(), s.to_owned()))
             })
             .collect(),
@@ -575,13 +694,18 @@ pub enum Event {
     #[serde(rename = "event/window.closed")]
     WindowClosed { id: u64 },
     #[serde(rename = "event/focus.changed")]
-    FocusChanged { previous_id: Option<u64>, id: Option<u64> },
+    FocusChanged {
+        previous_id: Option<u64>,
+        id: Option<u64>,
+    },
     #[serde(rename = "event/display.changed")]
     DisplayChanged { visible: bool },
     #[serde(rename = "event/output.added")]
     OutputAdded { output: OutputJson },
     #[serde(rename = "event/output.removed")]
     OutputRemoved { id: String },
+    #[serde(rename = "event/frames.frame")]
+    FramesFrame { subscription_id: u64, frame: ImageResultJson },
 }
 
 impl Event {
@@ -596,6 +720,7 @@ impl Event {
             Event::DisplayChanged { .. } => "display.changed",
             Event::OutputAdded { .. } => "output.added",
             Event::OutputRemoved { .. } => "output.removed",
+            Event::FramesFrame { .. } => "frames.frame",
         }
     }
 
@@ -639,7 +764,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             c,
-            MethodCall::WindowsSetGeometry { id: 3, width: Some(800), .. }
+            MethodCall::WindowsSetGeometry {
+                id: 3,
+                width: Some(800),
+                ..
+            }
         ));
 
         let err = MethodCall::parse("nope.nope", None).unwrap_err();

@@ -69,7 +69,10 @@ fn spawn_daemon(config: &Config) -> anyhow::Result<()> {
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(std::env::args_os().skip(1))
         .env("AGENTDESK_DAEMON_CHILD", "1")
@@ -96,7 +99,10 @@ fn spawn_daemon(config: &Config) -> anyhow::Result<()> {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("daemon 未在时限内就绪，已终止；日志: {}", log_path.display());
+            anyhow::bail!(
+                "daemon 未在时限内就绪，已终止；日志: {}",
+                log_path.display()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -134,39 +140,60 @@ fn run(config: Config) -> anyhow::Result<()> {
     })?;
 
     // 查看器线程 → 主循环 的事件通道
-    let (viewer_events_tx, viewer_events_rx) =
-        calloop::channel::channel::<viewer::ViewerEvent>();
+    let (viewer_events_tx, viewer_events_rx) = calloop::channel::channel::<viewer::ViewerEvent>();
+    let (clipboard_results_tx, clipboard_results_rx) =
+        calloop::channel::channel::<state::ClipboardResult>();
 
-    let mut state = AgentDesk::new(&dh, &config, hub, viewer_events_tx);
+    let mut state = AgentDesk::new(&dh, &config, hub, viewer_events_tx, clipboard_results_tx)?;
 
     let mut event_loop: calloop::EventLoop<AgentDesk> = calloop::EventLoop::try_new()?;
     state.loop_signal = Some(event_loop.get_signal());
     let loop_handle = event_loop.handle();
 
     loop_handle
-        .insert_source(viewer_events_rx, |event, _, state: &mut AgentDesk| {
-            match event {
+        .insert_source(
+            viewer_events_rx,
+            |event, _, state: &mut AgentDesk| match event {
                 calloop::channel::Event::Msg(ev) => control::handle_viewer_event(state, ev),
                 calloop::channel::Event::Closed => {}
+            },
+        )
+        .map_err(|_e| anyhow::anyhow!("挂载查看器事件 source 失败"))?;
+
+    loop_handle
+        .insert_source(clipboard_results_rx, |event, _, state: &mut AgentDesk| {
+            if let calloop::channel::Event::Msg(result) = event {
+                let outcome = result
+                    .result
+                    .map(|text| serde_json::json!({"text":text}))
+                    .map_err(|error| {
+                        ad_ipc::error::RpcError::new(ad_ipc::error::codes::INTERNAL, error)
+                    });
+                state
+                    .hub
+                    .respond(result.conn_id, Some(result.request_id), outcome);
             }
         })
-        .map_err(|_e| anyhow::anyhow!("挂载查看器事件 source 失败"))?;
+        .map_err(|_e| anyhow::anyhow!("挂载剪贴板读取结果 source 失败"))?;
 
     // 控制平面请求 → 主循环
     loop_handle
-        .insert_source(ipc_server.channel, |event, _, state: &mut AgentDesk| {
-            match event {
+        .insert_source(
+            ipc_server.channel,
+            |event, _, state: &mut AgentDesk| match event {
                 calloop::channel::Event::Msg(req) => control::handle_ipc(state, req),
                 calloop::channel::Event::Closed => {}
-            }
-        })
+            },
+        )
         .map_err(|_e| anyhow::anyhow!("挂载 IPC channel source 失败"))?;
 
     // Wayland 客户端接入
     let socket_source = ListeningSocketSource::with_name(&config.wayland_socket_name)?;
     loop_handle
         .insert_source(socket_source, |stream, _, state: &mut AgentDesk| {
-            let _ = state.dh.insert_client(stream, Arc::new(ClientState::default()));
+            let _ = state
+                .dh
+                .insert_client(stream, Arc::new(ClientState::default()));
         })
         .map_err(|_e| anyhow::anyhow!("挂载 Wayland socket source 失败"))?;
 

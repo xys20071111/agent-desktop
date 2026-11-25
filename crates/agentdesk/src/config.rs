@@ -19,7 +19,7 @@ pub struct Cli {
     #[arg(long)]
     pub socket: Option<PathBuf>,
 
-    /// 渲染器：auto | glow | pixman（M3 起生效，当前恒为 none）
+    /// 渲染器：auto | glow | pixman（Glow 使用 surfaceless EGL + 离屏 renderbuffer）
     #[arg(long, default_value = "auto")]
     pub renderer: String,
 
@@ -42,6 +42,16 @@ pub struct Cli {
     /// 启动后向 stdout 打印一行 JSON（socket 路径等信息），便于脚本解析
     #[arg(long)]
     pub print_info: bool,
+
+    /// Disable all `windows.launch` requests.
+    #[arg(long)]
+    pub deny_launch: bool,
+    /// Newline-separated list of absolute executable paths permitted by `windows.launch`.
+    #[arg(long)]
+    pub launch_allowlist: Option<PathBuf>,
+    /// Restrict screenshot file output to this existing directory.
+    #[arg(long)]
+    pub capture_output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +71,9 @@ pub struct Config {
     pub renderer: RendererKind,
     pub token: Option<String>,
     pub print_info: bool,
+    pub deny_launch: bool,
+    pub launch_allowlist: Option<Vec<PathBuf>>,
+    pub capture_output_dir: Option<PathBuf>,
     pub daemon: bool,
     pub daemon_log: Option<PathBuf>,
     pub x11_display: Option<u32>,
@@ -89,6 +102,24 @@ impl Config {
         } else {
             None
         };
+        let launch_allowlist = cli.launch_allowlist.as_ref().map(|path| {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("读取 launch allowlist {} 失败: {e}", path.display()))?;
+            contents.lines().enumerate().filter_map(|(line_no, line)| {
+                let item = line.split('#').next().unwrap_or("").trim();
+                (!item.is_empty()).then_some((line_no + 1, item))
+            }).map(|(line_no, item)| {
+                let path = PathBuf::from(item);
+                if !path.is_absolute() { anyhow::bail!("allowlist 第 {line_no} 行必须是绝对可执行文件路径: {item}"); }
+                std::fs::canonicalize(&path).map_err(|e| anyhow::anyhow!("allowlist 第 {line_no} 行路径无效 {}: {e}", path.display()))
+            }).collect::<anyhow::Result<Vec<_>>>()
+        }).transpose()?;
+        let capture_output_dir = cli.capture_output_dir.as_ref().map(|path| {
+            let canonical = std::fs::canonicalize(path)
+                .map_err(|e| anyhow::anyhow!("截图输出目录无效 {}: {e}", path.display()))?;
+            if !canonical.is_dir() { anyhow::bail!("截图输出路径不是目录: {}", canonical.display()); }
+            Ok::<_, anyhow::Error>(canonical)
+        }).transpose()?;
         let instance = cli.instance;
         let wayland_socket_name = format!("agentdesk-{instance}");
         Ok(Config {
@@ -100,6 +131,9 @@ impl Config {
             renderer,
             token: cli.token,
             print_info: cli.print_info,
+            deny_launch: cli.deny_launch,
+            launch_allowlist,
+            capture_output_dir,
             daemon: cli.daemon,
             daemon_log: cli.daemon_log,
             x11_display: cli.x11_display,

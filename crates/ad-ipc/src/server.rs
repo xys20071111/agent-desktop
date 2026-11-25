@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -55,11 +56,15 @@ pub enum IpcRequest {
 }
 
 struct ConnShared {
-    writer: mpsc::Sender<String>,
+    writer: mpsc::Sender<Outbound>,
+    frame_wake: mpsc::SyncSender<()>,
+    frame_pending: Arc<Mutex<Option<String>>>,
     authenticated: Arc<AtomicBool>,
     auth_failures: Arc<AtomicU64>,
     patterns: Arc<Mutex<Vec<String>>>,
 }
+
+struct Outbound { line: String, fd: Option<OwnedFd> }
 
 type ConnMap = Arc<Mutex<HashMap<u64, ConnShared>>>;
 
@@ -73,6 +78,13 @@ impl IpcHub {
     /// 回写一个请求的响应。
     pub fn respond(&self, conn_id: u64, id: Option<Id>, outcome: Result<Value, RpcError>) {
         self.send(conn_id, Outgoing::response(id, outcome));
+    }
+
+    /// Send a JSON-RPC response and transfer one descriptor with SCM_RIGHTS.
+    pub fn respond_with_fd(&self, conn_id: u64, id: Id, outcome: Result<Value, RpcError>, fd: OwnedFd) {
+        let Some(line) = Outgoing::response(Some(id), outcome).to_line() else { return };
+        let writer = self.conns.lock().unwrap().get(&conn_id).map(|c| c.writer.clone());
+        if let Some(writer) = writer { let _ = writer.send(Outbound { line, fd: Some(fd) }); }
     }
 
     /// 向所有订阅了该事件类型的连接广播。
@@ -92,7 +104,7 @@ impl IpcHub {
         let conns = self.conns.lock().unwrap();
         for c in conns.values() {
             if subscribed(&c.patterns.lock().unwrap(), name) {
-                let _ = c.writer.send(line.clone());
+            let _ = c.writer.send(Outbound { line: line.clone(), fd: None });
             }
         }
     }
@@ -103,7 +115,23 @@ impl IpcHub {
         let Some(line) = out.to_line() else { return };
         let writer = self.conns.lock().unwrap().get(&conn_id).map(|c| c.writer.clone());
         if let Some(w) = writer {
-            let _ = w.send(line);
+            let _ = w.send(Outbound { line, fd: None });
+        }
+    }
+
+    /// Push an arbitrary JSON-RPC notification to one connection.
+    pub fn notify_method(&self, conn_id: u64, method: &str, params: Value) {
+        let Some(line) = Outgoing::notification(method.to_owned(), params).to_line() else { return };
+        if method == "event/frames.frame" {
+            let target = self.conns.lock().unwrap().get(&conn_id)
+                .map(|c| (c.frame_wake.clone(), c.frame_pending.clone()));
+            if let Some((wake, pending)) = target {
+                *pending.lock().unwrap() = Some(line);
+                let _ = wake.try_send(());
+            }
+        } else {
+            let writer = self.conns.lock().unwrap().get(&conn_id).map(|c| c.writer.clone());
+            if let Some(writer) = writer { let _ = writer.send(Outbound { line, fd: None }); }
         }
     }
 
@@ -130,7 +158,7 @@ impl IpcHub {
         };
         let writer = self.conns.lock().unwrap().get(&conn_id).map(|c| c.writer.clone());
         if let Some(w) = writer {
-            if w.send(line).is_err() {
+            if w.send(Outbound { line, fd: None }).is_err() {
                 debug!(conn_id, "writer 已退出，响应丢弃");
             }
         }
@@ -234,7 +262,9 @@ fn setup_conn(
         return;
     }
     let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
-    let (wtx, wrx) = mpsc::channel::<String>();
+    let (wtx, wrx) = mpsc::channel::<Outbound>();
+    let (frame_wake, frame_rx) = mpsc::sync_channel::<()>(1);
+    let frame_pending = Arc::new(Mutex::new(None));
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -242,12 +272,15 @@ fn setup_conn(
             return;
         }
     };
+    let frame_pending_writer = frame_pending.clone();
     let _ = std::thread::Builder::new()
         .name(format!("ad-ipc-w{conn_id}"))
-        .spawn(move || writer_loop(write_stream, wrx));
+        .spawn(move || writer_loop(write_stream, wrx, frame_rx, frame_pending_writer));
 
     let shared = ConnShared {
         writer: wtx,
+        frame_wake,
+        frame_pending,
         authenticated: Arc::new(AtomicBool::new(cfg.token.is_none())),
         auth_failures: Arc::new(AtomicU64::new(0)),
         patterns: Arc::new(Mutex::new(Vec::new())),
@@ -268,12 +301,56 @@ fn setup_conn(
         .spawn(move || conn_loop(conn_id, stream, cfg2, conns2, tx2, authenticated));
 }
 
-fn writer_loop(mut stream: UnixStream, rx: mpsc::Receiver<String>) {
-    for line in rx {
-        if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
-            break;
-        }
+fn writer_loop(
+    mut stream: UnixStream,
+    rx: mpsc::Receiver<Outbound>,
+    frame_wake: mpsc::Receiver<()>,
+    frame_pending: Arc<Mutex<Option<String>>>,
+) {
+    loop {
+        let pending_frame = || frame_pending.lock().unwrap().take().map(|line| Outbound { line, fd: None });
+        let outbound = if frame_wake.try_recv().is_ok() {
+            pending_frame()
+        } else {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(outbound) => Some(outbound),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if frame_wake.try_recv().is_ok() { pending_frame() } else { None }
+                }
+            }
+        };
+        let Some(outbound) = outbound else { continue };
+        let result = match outbound.fd {
+            Some(fd) => send_fd_message(&stream, outbound.line.as_bytes(), fd.as_raw_fd()),
+            None => stream.write_all(outbound.line.as_bytes()),
+        };
+        if result.is_err() || stream.flush().is_err() { break; }
     }
+}
+
+fn send_fd_message(stream: &UnixStream, bytes: &[u8], fd: i32) -> io::Result<()> {
+    if bytes.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty fd response")); }
+    let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut _, iov_len: bytes.len() };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize };
+    let mut control = vec![0u8; space];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut _;
+    msg.msg_controllen = control.len();
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut i32, fd);
+    }
+    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+    if sent < 0 { return Err(io::Error::last_os_error()); }
+    let sent = sent as usize;
+    if sent < bytes.len() { let mut writer = stream; writer.write_all(&bytes[sent..])?; }
+    Ok(())
 }
 
 #[derive(PartialEq)]
@@ -354,8 +431,15 @@ fn handle_line(
         return Control::Continue;
     };
 
-    // 鉴权闸门（auth 方法本身放行）
-    if cfg.token.is_some() && incoming.method != "auth" && !authenticated.load(Ordering::Relaxed) {
+    // Authentication attempts count toward the same three-strike disconnect,
+    // including repeated invalid `auth` calls (not just calls to other methods).
+    if let Some(expected) = cfg.token.as_deref() {
+        let supplied = (incoming.method == "auth")
+            .then(|| incoming.params.as_ref().and_then(|p| p.get("token")).and_then(Value::as_str))
+            .flatten();
+        let invalid_auth = incoming.method == "auth" && supplied != Some(expected);
+        let unauthenticated_call = incoming.method != "auth" && !authenticated.load(Ordering::Acquire);
+        if invalid_auth || unauthenticated_call {
         let failures = {
             let m = conns.lock().unwrap();
             match m.get(&conn_id) {
@@ -373,10 +457,12 @@ fn handle_line(
             Some(id),
             Err(RpcError::new(
                 codes::PERMISSION_DENIED,
-                format!("需要先 auth（已失败 {f} 次）"),
+                if invalid_auth { format!("auth 令牌无效（已失败 {f} 次）") }
+                else { format!("需要先 auth（已失败 {f} 次）") },
             )),
         );
         return if f >= 3 { Control::Close } else { Control::Continue };
+        }
     }
 
     match MethodCall::parse(&incoming.method, incoming.params.as_ref()) {
@@ -399,7 +485,7 @@ fn direct_respond(conns: &ConnMap, conn_id: u64, id: Option<Id>, outcome: Result
     if let Some(line) = out.to_line() {
         let writer = conns.lock().unwrap().get(&conn_id).map(|c| c.writer.clone());
         if let Some(w) = writer {
-            let _ = w.send(line);
+            let _ = w.send(Outbound { line, fd: None });
         }
     }
 }

@@ -7,3 +7,4 @@ Cargo.lock.bak
 .demo*
 target/e2e-*
 .cargo-home
+shots/

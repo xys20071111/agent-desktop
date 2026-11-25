@@ -22,6 +22,8 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 
 若服务器以 `--token` 启动，客户端的第一条**请求**必须是 `auth`（见 §4.1），否则任何其他请求返回 `-32007 permission_denied` 且连续 3 次失败后断开。
 
+每个连接连续 3 次提交错误令牌或未认证调用都会被断开；成功 `auth` 后同连接上的后续调用不再需要重复令牌。
+
 ## 2. 通用约定
 
 - **坐标系**：全局布局坐标（与窗口 `geometry` 同一坐标系），原点为主虚拟输出左上角，单位为逻辑像素（scale=1）。
@@ -85,10 +87,12 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 | `windows.focus` | `{"id":7}` | `{"ok":true}` |
 | `windows.raise` | `{"id":7}` | `{"ok":true}` |
 | `windows.set_geometry` | `{"id":7,"x":40,"y":40,"width":1024,"height":768}`（均可部分省略） | `{"ok":true}` |
-| `windows.minimize` / `windows.restore` | `{"id":7}` | `{"ok":true}` ⏳ 未实现（v1.1） |
-| `windows.set_fullscreen` | `{"id":7,"enabled":true}` | `{"ok":true}` ⏳ 未实现（v1.1） |
+| `windows.minimize` / `windows.restore` | `{"id":7}` | `{"ok":true}` |
+| `windows.set_fullscreen` | `{"id":7,"enabled":true}` | `{"ok":true}`（向客户端发送 xdg_toplevel configure） |
 
 `windows.launch`：子进程环境自动注入 `WAYLAND_DISPLAY=agentdesk-<instance>`；`x11:true` 时改为注入 `DISPLAY=:<n>`（satellite 未运行则先拉起）。`wait_for_window_ms` 内出现该 pid 的窗口则回填 `window_id`，否则为 `null`（进程仍已启动）。
+
+服务端可用 `--deny-launch` 禁止该方法（返回 `-32007 permission_denied`），或用 `--launch-allowlist FILE` 限制可执行文件。Allowlist 为 UTF-8 文本，每行一个现存绝对路径（允许空行和 `#` 注释）；启动时规范化路径，启动请求也按解析后的可执行文件规范路径精确匹配。两种策略同时配置时 deny 优先。
 
 `WindowJson`：
 
@@ -166,12 +170,16 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 | `layout.tile` | `{"output":"HEADLESS-1","direction":"grid","padding":8}` | 一次性网格排列 |
 | `layout.cascade` | `{"output":"HEADLESS-1","offset":32}` | 一次性级联排列 |
 
-### 3.7 clipboard ⏳ 未实现（v1.1，协议已定义）
+### 3.7 clipboard（v1.1，部分实现）
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
 | `clipboard.set` | `{"text":"…"}` | `{"ok":true}`（wayland + primary 双写） |
 | `clipboard.get` | `{"which":"regular"}` | `{"text":"…"}`（`regular`｜`primary`；无文本返回 `null`） |
+
+实现说明：`clipboard.set` 将 UTF-8 文本作为 `text/plain` 提供给 Wayland data-device 与 primary-selection 客户端；`clipboard.get` 可读取合成器发布的内容，也可通过 fd 请求当前焦点客户端的 selection。客户端数据在工作线程读取（2 秒超时），不会阻塞合成器主循环。当前支持 UTF-8 文本 MIME 类型。
+
+截图文件输出：`to_path` 必须是绝对路径。设置服务端 `--capture-output-dir DIR` 后，以启动时打开并保持的目录 fd 为边界，逐段使用 `openat(O_NOFOLLOW)` 打开父目录，再写临时文件并 `renameat` 原子替换目标；拒绝父目录符号链接和越界路径，避免校验/写入间的 TOCTOU 与符号链接写出。文件权限为 0600。未设置该选项时仍允许任意绝对输出路径，但同样使用不跟随符号链接的逐段打开与原子替换。
 
 ### 3.8 events
 
@@ -181,6 +189,15 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 | `events.unsubscribe` | `{"subscription_id":1}` | `{"ok":true}` |
 
 事件类型支持通配 `*`（仅段级）：`window.created`、`window.updated`、`window.closed`、`focus.changed`、`display.changed`、`output.added`、`output.removed`。
+
+### 3.9 frames
+
+| 方法 | 参数 | 返回 |
+|---|---|---|
+| `frames.subscribe` | `{"output":"HEADLESS-1","fps":5}` | `{"subscription_id":1,"fps":5,"format":"jpeg"}` |
+| `frames.unsubscribe` | `{"subscription_id":1}` | `{"ok":true}` |
+
+每连接最多一个帧订阅；fps 默认 5，允许 1–30。服务器以 `event/frames.frame` notification 推送 `{subscription_id,frame,ts_ms}`，其中 frame 是 JPEG/base64 `ImageResult`。写入队列采用单槽最新帧合并，慢客户端会跳过过期帧而不会无限积压。取消订阅会停止后续采集；连接断开自动取消。当前实现使用 JPEG quality 75。
 
 ### 3.9 x11
 
@@ -205,9 +222,9 @@ Agent 与 `agentdesk` 合成器之间的全部交互走本协议。传输层为 
 
 节流策略：`window.updated` 中 geometry 连续变化按 ~16ms 合并；其余立即推送。
 
-## 5. `via_fd` 图像传输 ⏳ 未实现（v1.1；当前请求会返回 invalid_params，请用 base64/to_path）
+## 5. `via_fd` 图像传输
 
-请求带 `"via_fd":true` 时，合成器创建 memfd（或 `to_path` 语义下的普通文件不适用此模式），图像写入后 fd 以 SCM_RIGHTS 附加在响应帧之后。客户端按"读一行 JSON → 立即 recvmsg 收 fd"处理。此模式避免大图 base64 的 ~33% 膨胀，适合高频截图。
+请求带 `"via_fd":true` 时，合成器创建 memfd，图像写入后 fd 以 SCM_RIGHTS 附加在对应 JSON-RPC 响应上。`ad-ipc::Client::call_with_fd` 返回 `(result, Option<OwnedFd>)`；fd 文件偏移已回卷至 0。该模式适用于 screen 与 window 截图的 png/jpeg/raw；不能与 `to_path` 同用。直接使用 socket 的客户端需用 `recvmsg` 接收 ancillary descriptor。
 
 ## 6. adctl 命令映射
 

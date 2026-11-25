@@ -6,9 +6,15 @@
 //! - 收到的可打印键盘文本追加到窗口标题（供 type_text 断言）
 //! - 收到 close 请求即退出
 
+use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
+use smithay_client_toolkit::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
+use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
+use smithay_client_toolkit::data_device_manager::data_source::{CopyPasteSource, DataSourceHandler};
+use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, WritePipe};
 use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
@@ -17,6 +23,7 @@ use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
+use smithay_client_toolkit::reexports::client::protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_data_source::WlDataSource};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
@@ -47,6 +54,9 @@ struct Cli {
     width: u32,
     #[arg(long, default_value = "240")]
     height: u32,
+    /// Publish this text as the regular selection after receiving keyboard focus.
+    #[arg(long)]
+    clipboard_text: Option<String>,
 }
 
 fn parse_color(s: &str) -> [u8; 3] {
@@ -69,6 +79,7 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor 不可用");
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_shell 不可用");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm 不可用");
+    let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).expect("wl_data_device_manager 不可用");
 
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::None, &qh);
@@ -88,6 +99,10 @@ fn main() {
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
+        data_device_manager,
+        data_device: None,
+        clipboard_text: cli.clipboard_text.clone(),
+        clipboard_source: None,
         cli_title: cli.title.clone(),
         title_extra: String::new(),
         colors: [parse_color(&cli.color), parse_color(&cli.alt_color)],
@@ -117,6 +132,10 @@ struct TestClient {
     seat_state: SeatState,
     output_state: OutputState,
     shm: Shm,
+    data_device_manager: DataDeviceManagerState,
+    data_device: Option<DataDevice>,
+    clipboard_text: Option<String>,
+    clipboard_source: Option<CopyPasteSource>,
 
     cli_title: String,
     title_extra: String,
@@ -292,6 +311,9 @@ impl SeatHandler for TestClient {
                 .get_keyboard(qh, &seat, None)
                 .expect("keyboard 创建失败");
             self.keyboard = Some(keyboard);
+            if self.clipboard_text.is_some() && self.data_device.is_none() {
+                self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
+            }
         }
         if capability == Capability::Pointer && self.pointer.is_none() {
             let pointer = self.seat_state.get_pointer(qh, &seat).expect("pointer 创建失败");
@@ -320,14 +342,23 @@ impl SeatHandler for TestClient {
 impl KeyboardHandler for TestClient {
     fn enter(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
-        _: u32,
+        surface: &wl_surface::WlSurface,
+        serial: u32,
         _: &[u32],
         _keysyms: &[Keysym],
     ) {
+        if surface == self.window.wl_surface() {
+            if let (Some(_text), Some(device)) = (self.clipboard_text.clone(), self.data_device.as_ref()) {
+                let source = self.data_device_manager.create_copy_paste_source(qh, ["text/plain;charset=utf-8", "text/plain"]);
+                source.set_selection(device, serial);
+                self.clipboard_source = Some(source);
+                self.window.set_title("clipboard-source-ready");
+                self.window.commit();
+            }
+        }
     }
 
     fn leave(
@@ -417,6 +448,35 @@ impl PointerHandler for TestClient {
             }
         }
     }
+}
+
+impl DataDeviceHandler for TestClient {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for TestClient {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+}
+
+impl DataSourceHandler for TestClient {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, mime: String, pipe: WritePipe) {
+        if mime == "text/plain;charset=utf-8" || mime == "text/plain" {
+            if let Some(text) = &self.clipboard_text {
+                let mut file = std::fs::File::from(OwnedFd::from(pipe));
+                let _ = file.write_all(text.as_bytes());
+            }
+        }
+    }
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) { self.clipboard_source = None; }
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
 impl ShmHandler for TestClient {

@@ -3,7 +3,9 @@
 //! `call` 会跳过服务器推送的事件；`try_next_event` 用于 `watch`。
 
 use std::collections::VecDeque;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -16,9 +18,9 @@ use crate::rpc::Id;
 use crate::transport;
 
 /// 服务器推送的一条消息。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ServerMsg {
-    Response { id: Option<Id>, result: Result<Value, RpcError> },
+    Response { id: Option<Id>, result: Result<Value, RpcError>, fd: Option<OwnedFd> },
     Notification { method: String, params: Value },
 }
 
@@ -33,7 +35,9 @@ pub enum ClientError {
 }
 
 pub struct Client {
-    reader: BufReader<UnixStream>,
+    reader: UnixStream,
+    read_buffer: VecDeque<u8>,
+    received_fds: VecDeque<OwnedFd>,
     writer: UnixStream,
     next_id: u64,
     events: VecDeque<Event>,
@@ -47,7 +51,9 @@ impl Client {
         stream.set_read_timeout(Some(POLL_SLICE))?;
         let writer = stream.try_clone()?;
         Ok(Client {
-            reader: BufReader::new(stream),
+            reader: stream,
+            read_buffer: VecDeque::new(),
+            received_fds: VecDeque::new(),
             writer,
             next_id: 1,
             events: VecDeque::new(),
@@ -64,6 +70,14 @@ impl Client {
     }
 
     pub fn call_raw(&mut self, method: &str, params: Option<Value>) -> Result<Value, ClientError> {
+        self.call_raw_with_fd(method, params).map(|(value, _fd)| value)
+    }
+
+    pub fn call_with_fd(&mut self, method: &str, params: Value) -> Result<(Value, Option<OwnedFd>), ClientError> {
+        self.call_raw_with_fd(method, Some(params))
+    }
+
+    pub fn call_raw_with_fd(&mut self, method: &str, params: Option<Value>) -> Result<(Value, Option<OwnedFd>), ClientError> {
         let id = Id::Num(self.next_id);
         self.next_id += 1;
         let mut obj = serde_json::Map::new();
@@ -80,9 +94,9 @@ impl Client {
         self.writer.flush()?;
         loop {
             match self.read_msg(None)?.expect("deadline=None 不应超时") {
-                ServerMsg::Response { id: rid, result } => {
+                ServerMsg::Response { id: rid, result, fd } => {
                     if rid.as_ref() == Some(&id) {
-                        return result.map_err(ClientError::Rpc);
+                        return result.map(|value| (value, fd)).map_err(ClientError::Rpc);
                     }
                     // 其他 id 的响应（不应该出现）——忽略
                 }
@@ -120,7 +134,7 @@ impl Client {
         }
     }
 
-    fn parse_msg(&self, line: &str) -> Result<ServerMsg, ClientError> {
+    fn parse_msg(&mut self, line: &str) -> Result<ServerMsg, ClientError> {
         let v: Value = serde_json::from_str(line)
             .map_err(|e| ClientError::Protocol(format!("非法 JSON 行: {e}")))?;
         if let Some(method) = v.get("method").and_then(Value::as_str) {
@@ -136,7 +150,7 @@ impl Client {
         } else {
             return Err(ClientError::Protocol("消息既无 result 也无 error".into()));
         };
-        Ok(ServerMsg::Response { id, result })
+        Ok(ServerMsg::Response { id, result, fd: self.received_fds.pop_front() })
     }
 
     /// 读一行。`deadline` 为 None 表示无限等待；超时返回 None。
@@ -144,7 +158,7 @@ impl Client {
     fn read_msg(&mut self, deadline: Option<Instant>) -> Result<Option<ServerMsg>, ClientError> {
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            match self.reader.read_until(b'\n', &mut buf) {
+            match self.read_line_bytes(&mut buf) {
                 Ok(0) => {
                     return Err(ClientError::Io(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -177,6 +191,44 @@ impl Client {
                 }
                 Err(e) => return Err(e.into()),
             }
+        }
+    }
+
+    /// Read bytes with recvmsg so ancillary descriptors are retained instead of
+    /// being consumed by a buffered reader before their JSON response is parsed.
+    fn read_line_bytes(&mut self, line: &mut Vec<u8>) -> io::Result<usize> {
+        loop {
+            while let Some(byte) = self.read_buffer.pop_front() {
+                line.push(byte);
+                if byte == b'\n' { return Ok(line.len()); }
+            }
+            let mut data = [0u8; 8192];
+            let mut control = [0usize; 32];
+            let mut iov = libc::iovec { iov_base: data.as_mut_ptr() as *mut _, iov_len: data.len() };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut _;
+            msg.msg_controllen = std::mem::size_of_val(&control);
+            let got = unsafe { libc::recvmsg(self.reader.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            if got < 0 { return Err(io::Error::last_os_error()); }
+            if got == 0 { return Ok(0); }
+            if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "SCM_RIGHTS 控制消息被截断"));
+            }
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                        let payload_len = (*cmsg).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
+                        let count = payload_len / std::mem::size_of::<i32>();
+                        let fds = libc::CMSG_DATA(cmsg) as *const i32;
+                        for index in 0..count { self.received_fds.push_back(OwnedFd::from_raw_fd(*fds.add(index))); }
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+            self.read_buffer.extend(&data[..got as usize]);
         }
     }
 }

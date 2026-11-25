@@ -7,17 +7,76 @@ use ad_ipc::protocol::MethodCall;
 use ad_ipc::server::IpcRequest;
 
 use crate::state::{now_ms, AgentDesk};
+use smithay::wayland::selection::data_device::set_data_device_selection;
+use smithay::wayland::selection::primary_selection::set_primary_selection;
 
 pub fn handle_ipc(state: &mut AgentDesk, req: IpcRequest) {
     match req {
         IpcRequest::Connected { conn_id } => {
             let info = state.server_info();
-            state.hub.notify(conn_id, &ad_ipc::protocol::Event::ServerHello { info });
+            state
+                .hub
+                .notify(conn_id, &ad_ipc::protocol::Event::ServerHello { info });
         }
         IpcRequest::Call { conn_id, id, call } => {
+            let fd_capture = match &call {
+                MethodCall::ScreenCapture { output, opts } if opts.via_fd == Some(true) => Some((None, output.clone(), opts.clone())),
+                MethodCall::WindowsScreenshot { id: wid, opts } if opts.via_fd == Some(true) => Some((Some(*wid), None, opts.clone())),
+                _ => None,
+            };
+            if let Some((window_id, output, opts)) = fd_capture {
+                let outcome = (|| {
+                    let raw = if let Some(wid) = window_id { state.window_capture(wid)? } else { state.screen_capture(output.as_deref())? };
+                    let (result, fd) = state.encode_capture_fd(raw, &opts)?;
+                    let value = serde_json::to_value(result).map_err(|e| RpcError::internal(e.to_string()))?;
+                    Ok((value, fd))
+                })();
+                match outcome {
+                    Ok((value, fd)) => state.hub.respond_with_fd(conn_id, id, Ok(value), fd),
+                    Err(error) => state.hub.respond(conn_id, Some(id), Err(error)),
+                }
+                return;
+            }
+            if let MethodCall::ClipboardGet { which } = call {
+                match clipboard_get(
+                    state,
+                    conn_id,
+                    id.clone(),
+                    which.as_deref().unwrap_or("regular"),
+                ) {
+                    Ok(Some(value)) => state.hub.respond(conn_id, Some(id), Ok(value)),
+                    Ok(None) => {}
+                    Err(error) => state.hub.respond(conn_id, Some(id), Err(error)),
+                }
+                return;
+            }
+            if let MethodCall::ScreenCapture { opts, .. } | MethodCall::WindowsScreenshot { opts, .. } = &call {
+                if let Some(path) = opts.to_path.as_deref() {
+                    if let Err(error) = state.validate_capture_path(path) {
+                        state.hub.respond(conn_id, Some(id), Err(error));
+                        return;
+                    }
+                }
+            }
             // windows.launch 需要等待窗口出现：走延迟响应路径（绝不阻塞主循环）
-            if let MethodCall::WindowsLaunch { argv, cwd, env, x11, wait_for_window_ms } = call {
-                match launch_deferred(state, conn_id, id.clone(), argv, cwd, env, x11, wait_for_window_ms) {
+            if let MethodCall::WindowsLaunch {
+                argv,
+                cwd,
+                env,
+                x11,
+                wait_for_window_ms,
+            } = call
+            {
+                match launch_deferred(
+                    state,
+                    conn_id,
+                    id.clone(),
+                    argv,
+                    cwd,
+                    env,
+                    x11,
+                    wait_for_window_ms,
+                ) {
                     LaunchOutcome::Immediate(v) => state.hub.respond(conn_id, Some(id), Ok(v)),
                     LaunchOutcome::Deferred => {}
                     LaunchOutcome::Error(e) => state.hub.respond(conn_id, Some(id), Err(e)),
@@ -33,7 +92,78 @@ pub fn handle_ipc(state: &mut AgentDesk, req: IpcRequest) {
             tracing::debug!(conn_id, "控制客户端断开");
             // 断开的连接不再补发 launch 响应
             state.pending_launches.retain(|p| p.conn_id != conn_id);
+            state.frame_subscriptions.remove(&conn_id);
         }
+    }
+}
+
+/// Request client-owned selection data over a socketpair; only the reader blocks,
+/// while the compositor continues dispatching Wayland clients on its main loop.
+fn clipboard_get(
+    state: &mut AgentDesk,
+    conn_id: u64,
+    request_id: ad_ipc::rpc::Id,
+    which: &str,
+) -> Result<Option<Value>, RpcError> {
+    use smithay::wayland::selection::data_device::request_data_device_client_selection;
+    use smithay::wayland::selection::primary_selection::request_primary_client_selection;
+    use std::os::unix::net::UnixStream;
+
+    let primary = match which {
+        "regular" => false,
+        "primary" => true,
+        other => {
+            return Err(RpcError::invalid_params(format!(
+                "未知剪贴板类型 {other}（可选 regular|primary）"
+            )))
+        }
+    };
+    let (mut reader, writer) =
+        UnixStream::pair().map_err(|e| RpcError::internal(format!("剪贴板管道创建失败: {e}")))?;
+    reader
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| RpcError::internal(format!("剪贴板读取超时设置失败: {e}")))?;
+    let fd: std::os::fd::OwnedFd = writer.into();
+    let requested: Result<(), String> = if primary {
+        request_primary_client_selection(&state.seat, "text/plain;charset=utf-8".into(), fd)
+            .map_err(|e| format!("{e:?}"))
+    } else {
+        request_data_device_client_selection(&state.seat, "text/plain;charset=utf-8".into(), fd)
+            .map_err(|e| format!("{e:?}"))
+    };
+    match requested {
+        Ok(()) => {
+            let sender = state.clipboard_results.clone();
+            std::thread::Builder::new()
+                .name("agentdesk-clipboard-read".into())
+                .spawn(move || {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    let result = reader
+                        .read_to_string(&mut text)
+                        .map(|_| text)
+                        .map_err(|e| format!("剪贴板读取失败: {e}"));
+                    let _ = sender.send(crate::state::ClipboardResult {
+                        conn_id,
+                        request_id,
+                        result,
+                    });
+                })
+                .map_err(|e| RpcError::internal(format!("剪贴板读取线程创建失败: {e}")))?;
+            Ok(None)
+        }
+        Err(error) if error.contains("ServerSideSelection") => {
+            let text = if primary {
+                state.primary_text.as_deref()
+            } else {
+                state.clipboard_text.as_deref()
+            };
+            Ok(Some(json!({"text": text})))
+        }
+        Err(error) if error.contains("NoSelection") => Ok(Some(json!({"text": null}))),
+        Err(error) => Err(RpcError::invalid_params(format!(
+            "剪贴板不支持 UTF-8 文本: {error}"
+        ))),
     }
 }
 
@@ -95,14 +225,17 @@ pub fn handle_viewer_event(state: &mut AgentDesk, ev: crate::viewer::ViewerEvent
     if state.viewer_visible {
         state.viewer_visible = false;
         state.viewer_size = None;
-        state.hub.broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: false });
+        state
+            .hub
+            .broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: false });
     }
 }
 
 fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Result<Value, RpcError> {
     match call {
-        MethodCall::ServerInfo => serde_json::to_value(state.server_info())
-            .map_err(|e| RpcError::internal(e.to_string())),
+        MethodCall::ServerInfo => {
+            serde_json::to_value(state.server_info()).map_err(|e| RpcError::internal(e.to_string()))
+        }
         MethodCall::ServerPing => Ok(json!({ "pong": true, "ts_ms": now_ms() })),
         MethodCall::ServerShutdown => {
             state.shutting_down = true;
@@ -122,17 +255,63 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             Ok(json!({ "windows": state.list_windows(filter.as_ref()) }))
         }
         MethodCall::WindowsGet { id } => serde_json::to_value(
-            state.window_json(id).ok_or_else(|| RpcError::window_not_found(id))?,
+            state
+                .window_json(id)
+                .ok_or_else(|| RpcError::window_not_found(id))?,
         )
         .map_err(|e| RpcError::internal(e.to_string())),
         MethodCall::WindowsClose { id } => state.close_window(id).map(|_| json!({ "ok": true })),
         MethodCall::WindowsFocus { id } => state.focus_window(id).map(|_| json!({ "ok": true })),
         MethodCall::WindowsRaise { id } => state.raise_window(id).map(|_| json!({ "ok": true })),
-        MethodCall::WindowsSetGeometry { id, x, y, width, height } => state
+        MethodCall::WindowsSetGeometry {
+            id,
+            x,
+            y,
+            width,
+            height,
+        } => state
             .set_geometry(id, x, y, width, height)
             .map(|_| json!({ "ok": true })),
+        MethodCall::WindowsMinimize { id } => {
+            state.minimize_window(id).map(|_| json!({ "ok": true }))
+        }
+        MethodCall::WindowsRestore { id } => {
+            state.restore_window(id).map(|_| json!({ "ok": true }))
+        }
+        MethodCall::WindowsSetFullscreen { id, enabled } => {
+            if !state.windows.contains_key(&id) {
+                return Err(RpcError::window_not_found(id));
+            }
+            let toplevel = state
+                .windows
+                .get(&id)
+                .and_then(|r| r.element.toplevel())
+                .ok_or_else(|| RpcError::window_not_found(id))?;
+            toplevel.with_pending_state(|pending| {
+                if enabled {
+                    pending.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                    pending.size = Some(state.primary_output_size().into());
+                } else {
+                    pending.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                }
+            });
+            toplevel.send_configure();
+            Ok(json!({ "ok": true }))
+        }
 
         MethodCall::EventsSubscribe { types } => {
+            const MAX_PATTERNS: usize = 16;
+            const ALLOWED: &[&str] = &[
+                "*", "window.*", "window.created", "window.updated", "window.closed",
+                "focus.changed", "display.changed", "output.*", "output.added", "output.removed",
+                "frames.frame",
+            ];
+            if types.len() > MAX_PATTERNS {
+                return Err(RpcError::invalid_params(format!("events.subscribe 最多允许 {MAX_PATTERNS} 个类型")));
+            }
+            if let Some(unknown) = types.iter().find(|kind| !ALLOWED.contains(&kind.as_str())) {
+                return Err(RpcError::invalid_params(format!("不允许订阅事件类型 {unknown}")));
+            }
             state.hub.set_subscriptions(conn_id, types);
             Ok(json!({ "subscription_id": conn_id }))
         }
@@ -141,15 +320,22 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             Ok(json!({ "ok": true }))
         }
 
-        MethodCall::X11Status => serde_json::to_value(state.x11_status())
-            .map_err(|e| RpcError::internal(e.to_string())),
+        MethodCall::X11Status => {
+            serde_json::to_value(state.x11_status()).map_err(|e| RpcError::internal(e.to_string()))
+        }
         MethodCall::DisplayStatus => Ok(json!({
             "visible": state.viewer_visible,
             "output": state.primary_output().map(|o| o.name.clone()),
             "window_size": state.viewer_size.map(|(w, h)| json!({"width": w, "height": h})),
             "parent_session": state.parent_session,
         })),
-        MethodCall::DisplayShow { output: _, width, height, scale: _, title } => {
+        MethodCall::DisplayShow {
+            output: _,
+            width,
+            height,
+            scale: _,
+            title,
+        } => {
             if state.parent_session != Some("wayland") {
                 return Err(RpcError::new(
                     codes::NO_PARENT_SESSION,
@@ -160,8 +346,8 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
                 let (dw, dh) = state.primary_output_size();
                 let w = width.map(|v| v as i32).unwrap_or(dw);
                 let h = height.map(|v| v as i32).unwrap_or(dh);
-                let title = title
-                    .unwrap_or_else(|| format!("agentdesk ({})", state.wayland_socket_name));
+                let title =
+                    title.unwrap_or_else(|| format!("agentdesk ({})", state.wayland_socket_name));
                 let handle = crate::viewer::spawn(crate::viewer::ViewerParams {
                     title,
                     width: w,
@@ -171,7 +357,9 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
                 state.viewer = Some(handle);
                 state.viewer_visible = true;
                 state.viewer_size = Some((w, h));
-                state.hub.broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: true });
+                state
+                    .hub
+                    .broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: true });
                 tracing::info!(width = w, height = h, "嵌套查看器已显示");
                 Ok(json!({ "visible": true, "window_size": { "width": w, "height": h } }))
             } else {
@@ -186,18 +374,26 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             if state.viewer_visible {
                 state.viewer_visible = false;
                 state.viewer_size = None;
-                state.hub.broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: false });
+                state
+                    .hub
+                    .broadcast(&ad_ipc::protocol::Event::DisplayChanged { visible: false });
             }
             Ok(json!({ "visible": false }))
         }
 
-        MethodCall::WindowsLaunch { argv, cwd, env, x11, wait_for_window_ms } => {
+        MethodCall::WindowsLaunch {
+            argv,
+            cwd,
+            env,
+            x11,
+            wait_for_window_ms,
+        } => {
             let pid = state.launch_process(&argv, cwd.as_deref(), &env, x11)?;
             // 等待该 pid 的窗口出现（阻塞轮询，v1 简化；上限 5s）
             let mut window_id = None;
             if let Some(ms) = wait_for_window_ms {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(ms.min(5000));
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(ms.min(5000));
                 while window_id.is_none() && std::time::Instant::now() < deadline {
                     window_id = state.windows.values().find(|r| r.pid == pid).map(|r| r.id);
                     if window_id.is_none() {
@@ -208,7 +404,11 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             Ok(json!({ "pid": pid, "window_id": window_id }))
         }
 
-        MethodCall::LayoutTile { output, direction, padding } => {
+        MethodCall::LayoutTile {
+            output,
+            direction,
+            padding,
+        } => {
             if let Some(d) = direction.as_deref() {
                 if d != "grid" {
                     return Err(RpcError::invalid_params(format!(
@@ -222,7 +422,9 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
                 .iter()
                 .find(|o| o.name == name)
                 .map(|o| o.size)
-                .ok_or_else(|| RpcError::new(codes::OUTPUT_NOT_FOUND, format!("输出 {name} 不存在")))?;
+                .ok_or_else(|| {
+                    RpcError::new(codes::OUTPUT_NOT_FOUND, format!("输出 {name} 不存在"))
+                })?;
             let ids = windows_on_output(state, &name);
             let rects = ad_wm::layout::tile_grid(ids.len(), area, padding.unwrap_or(8));
             for (id, (x, y, w, h)) in ids.iter().zip(rects) {
@@ -247,7 +449,11 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
         }
 
         MethodCall::OutputsList => Ok(json!({ "outputs": state.outputs_json() })),
-        MethodCall::OutputsCreate { width, height, name } => {
+        MethodCall::OutputsCreate {
+            width,
+            height,
+            name,
+        } => {
             let id = state.output_create(width, height, name)?;
             Ok(json!({ "id": id }))
         }
@@ -255,7 +461,51 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             state.output_destroy(&id)?;
             Ok(json!({ "ok": true }))
         }
-        MethodCall::InputGetCursor => Ok(json!({ "x": state.cursor_pos.x, "y": state.cursor_pos.y })),
+        MethodCall::InputGetCursor => {
+            Ok(json!({ "x": state.cursor_pos.x, "y": state.cursor_pos.y }))
+        }
+
+        MethodCall::ClipboardSet { text } => {
+            let mime_types = vec![
+                "text/plain;charset=utf-8".to_string(),
+                "text/plain".to_string(),
+            ];
+            set_data_device_selection(&state.dh, &state.seat, mime_types.clone(), text.clone());
+            set_primary_selection(&state.dh, &state.seat, mime_types, text.clone());
+            state.clipboard_text = Some(text.clone());
+            state.primary_text = Some(text);
+            Ok(json!({ "ok": true }))
+        }
+        MethodCall::FramesSubscribe { output, fps } => {
+            let output = output.unwrap_or_else(|| primary_name(state));
+            if !state.outputs.iter().any(|item| item.name == output) {
+                return Err(RpcError::new(codes::OUTPUT_NOT_FOUND, format!("输出 {output} 不存在")));
+            }
+            let fps = fps.unwrap_or(5);
+            if !(1..=30).contains(&fps) { return Err(RpcError::invalid_params("frames.subscribe 的 fps 必须在 1..=30")); }
+            state.frame_subscriptions.insert(conn_id, crate::state::FrameSubscription {
+                output, fps, last_frame: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            });
+            Ok(json!({"subscription_id":conn_id,"fps":fps,"format":"jpeg"}))
+        }
+        MethodCall::FramesUnsubscribe { subscription_id } => {
+            if subscription_id != conn_id { return Err(RpcError::invalid_params("subscription_id 不属于当前连接")); }
+            state.frame_subscriptions.remove(&conn_id);
+            Ok(json!({"ok":true}))
+        }
+        MethodCall::ClipboardGet { which } => {
+            let which = which.as_deref().unwrap_or("regular");
+            let text = match which {
+                "regular" => state.clipboard_text.as_deref(),
+                "primary" => state.primary_text.as_deref(),
+                other => {
+                    return Err(RpcError::invalid_params(format!(
+                        "未知剪贴板类型 {other}（可选 regular|primary）"
+                    )))
+                }
+            };
+            Ok(json!({ "text": text }))
+        }
 
         MethodCall::ScreenCapture { output, opts } => {
             let raw = state.screen_capture(output.as_deref())?;
@@ -291,7 +541,12 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             }
             Ok(json!({ "ok": true }))
         }
-        MethodCall::InputClick { x, y, button, count } => {
+        MethodCall::InputClick {
+            x,
+            y,
+            button,
+            count,
+        } => {
             let b = crate::input::parse_button(button.as_deref())?;
             crate::input::click_at(state, x, y, b, count.unwrap_or(1));
             Ok(json!({ "ok": true }))
@@ -321,12 +576,13 @@ fn dispatch_call(state: &mut AgentDesk, conn_id: u64, call: MethodCall) -> Resul
             state.input_combo(&keys, hold_ms.unwrap_or(0))?;
             Ok(json!({ "ok": true }))
         }
-        MethodCall::InputTypeText { text, delay_ms_per_key } => {
+        MethodCall::InputTypeText {
+            text,
+            delay_ms_per_key,
+        } => {
             state.input_type_text(&text, delay_ms_per_key.unwrap_or(0))?;
             Ok(json!({ "ok": true }))
         }
-
-        other => Err(RpcError::not_implemented(method_name(&other))),
     }
 }
 
@@ -365,9 +621,14 @@ fn method_name(c: &MethodCall) -> &'static str {
         MethodCall::WindowsFocus { .. } => "windows.focus",
         MethodCall::WindowsRaise { .. } => "windows.raise",
         MethodCall::WindowsSetGeometry { .. } => "windows.set_geometry",
+        MethodCall::WindowsMinimize { .. } => "windows.minimize",
+        MethodCall::WindowsRestore { .. } => "windows.restore",
+        MethodCall::WindowsSetFullscreen { .. } => "windows.set_fullscreen",
         MethodCall::WindowsLaunch { .. } => "windows.launch",
         MethodCall::ScreenCapture { .. } => "screen.capture",
         MethodCall::WindowsScreenshot { .. } => "windows.screenshot",
+        MethodCall::FramesSubscribe { .. } => "frames.subscribe",
+        MethodCall::FramesUnsubscribe { .. } => "frames.unsubscribe",
         MethodCall::InputMoveCursor { .. } => "input.move_cursor",
         MethodCall::InputMoveRelative { .. } => "input.move_relative",
         MethodCall::InputButton { .. } => "input.button",

@@ -3,14 +3,17 @@
 //! 管线：RenderElements（Space 或单窗口）→ 离屏 Image → copy_framebuffer → 编码。
 //! 约定：帧数据为 BGRA8888（Fourcc::Argb8888 小端内存序），stride = width*4。
 
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::pixman::PixmanRenderer;
+use smithay::backend::renderer::glow::GlowRenderer;
+use smithay::backend::renderer::gles::GlesRenderbuffer;
 use smithay::backend::renderer::utils::draw_render_elements;
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, element::RenderElement};
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::utils::{Buffer, Rectangle, Scale, Size, Transform};
 use pixman::Image;
@@ -20,10 +23,27 @@ use ad_ipc::protocol::{CaptureOptions, ImageEncoding, ImageResultJson};
 
 use crate::state::AgentDesk;
 
+/// Bound raw capture allocations so one request cannot reserve hundreds of MiB.
+// Leave headroom for JSON/base64 expansion beneath the 64 MiB IPC frame limit.
+const MAX_CAPTURE_BYTES: u64 = 45 * 1024 * 1024;
+
+fn validate_capture_dimensions(width: i32, height: i32) -> Result<(), RpcError> {
+    if width <= 0 || height <= 0 || (width as u64).saturating_mul(height as u64).saturating_mul(4) > MAX_CAPTURE_BYTES {
+        return Err(RpcError::new(codes::CAPTURE_FAILED, "截图尺寸超过资源限制（最大 raw 帧 45 MiB）"));
+    }
+    Ok(())
+}
+
 smithay::render_elements! {
     pub CaptureElements<=PixmanRenderer>;
     Space = SpaceRenderElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>,
     Surface = WaylandSurfaceRenderElement<PixmanRenderer>,
+}
+
+smithay::render_elements! {
+    pub GlowCaptureElements<=GlowRenderer>;
+    Space = SpaceRenderElements<GlowRenderer, WaylandSurfaceRenderElement<GlowRenderer>>,
+    Surface = WaylandSurfaceRenderElement<GlowRenderer>,
 }
 
 /// 截图原始帧（BGRA8888）。
@@ -46,10 +66,15 @@ impl AgentDesk {
             })?
         };
         let size = output.current_mode().map(|m| m.size).unwrap_or_else(|| Size::from((1280, 720)));
+        validate_capture_dimensions(size.w, size.h)?;
 
-        let Some(renderer) = self.renderer.as_mut() else {
-            return Err(RpcError::internal("渲染器不可用"));
-        };
+        if let Some(renderer) = self.glow_renderer.as_mut() {
+            let elements: Vec<GlowCaptureElements> = self.space.render_elements_for_output(renderer, &output, 1.0)
+                .map_err(|e| RpcError::new(codes::CAPTURE_FAILED, format!("Glow 元素收集失败: {e}")))?
+                .into_iter().map(GlowCaptureElements::from).collect();
+            return render_to_buffer::<_, GlesRenderbuffer, _>(renderer, size, &elements, false);
+        }
+        let Some(renderer) = self.renderer.as_mut() else { return Err(RpcError::internal("渲染器不可用")); };
         let elements: Vec<CaptureElements> = self
             .space
             .render_elements_for_output(renderer, &output, 1.0)
@@ -70,10 +95,13 @@ impl AgentDesk {
             .clone();
         let bbox = window.bbox();
         let size = Size::from((bbox.size.w.max(1), bbox.size.h.max(1)));
+        validate_capture_dimensions(size.w, size.h)?;
 
-        let Some(renderer) = self.renderer.as_mut() else {
-            return Err(RpcError::internal("渲染器不可用"));
-        };
+        if let Some(renderer) = self.glow_renderer.as_mut() {
+            let elements: Vec<GlowCaptureElements> = window.render_elements(renderer, (0, 0).into(), Scale::from(1.0), 1.0);
+            return render_to_buffer::<_, GlesRenderbuffer, _>(renderer, size, &elements, true);
+        }
+        let Some(renderer) = self.renderer.as_mut() else { return Err(RpcError::internal("渲染器不可用")); };
         let elements: Vec<CaptureElements> =
             window.render_elements(renderer, (0, 0).into(), Scale::from(1.0), 1.0);
         self.render_elements_to_buffer(size, &elements, true)
@@ -131,7 +159,7 @@ impl AgentDesk {
         opts: &CaptureOptions,
     ) -> Result<ImageResultJson, RpcError> {
         if opts.via_fd == Some(true) {
-            return Err(RpcError::invalid_params("via_fd 尚未实现，请使用 base64 或 to_path"));
+            return Err(RpcError::invalid_params("via_fd 需要使用支持 SCM_RIGHTS 的 IPC 客户端"));
         }
         let format = opts.format.as_deref().unwrap_or("png").to_ascii_lowercase();
         let encoded: Vec<u8> = match format.as_str() {
@@ -146,8 +174,7 @@ impl AgentDesk {
         };
         match &opts.to_path {
             Some(path) => {
-                std::fs::write(path, &encoded)
-                    .map_err(|e| RpcError::internal(format!("写文件失败: {e}")))?;
+                self.write_capture_file(path, &encoded)?;
                 Ok(ImageResultJson {
                     format,
                     width: raw.width as u32,
@@ -173,6 +200,58 @@ impl AgentDesk {
             }
         }
     }
+
+    pub fn encode_capture_fd(&self, raw: RawFrame, opts: &CaptureOptions) -> Result<(ImageResultJson, OwnedFd), RpcError> {
+        if opts.to_path.is_some() { return Err(RpcError::invalid_params("via_fd 与 to_path 不能同时指定")); }
+        let format = opts.format.as_deref().unwrap_or("png").to_ascii_lowercase();
+        let encoded = match format.as_str() {
+            "png" => encode_png(&raw)?,
+            "jpeg" | "jpg" => encode_jpeg(&raw, opts.quality.unwrap_or(85))?,
+            "raw" => raw.data,
+            other => return Err(RpcError::invalid_params(format!("未知格式 {other}（可选 png|jpeg|raw）"))),
+        };
+        let name = std::ffi::CString::new("agentdesk-capture").unwrap();
+        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if raw_fd < 0 { return Err(RpcError::internal(format!("memfd 创建失败: {}", std::io::Error::last_os_error()))); }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mut file = std::fs::File::from(fd);
+        file.write_all(&encoded).map_err(|e| RpcError::internal(format!("截图写入 memfd 失败: {e}")))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| RpcError::internal(format!("memfd 回卷失败: {e}")))?;
+        let fd = file.into();
+        Ok((ImageResultJson {
+            format,
+            width: raw.width as u32,
+            height: raw.height as u32,
+            encoding: ImageEncoding::Fd,
+            data: None,
+            path: None,
+            sha256: None,
+        }, fd))
+    }
+}
+
+fn render_to_buffer<R, B, E>(renderer: &mut R, size: Size<i32, smithay::utils::Physical>, elements: &[E], transparent: bool) -> Result<RawFrame, RpcError>
+where
+    R: Renderer + Bind<B> + Offscreen<B> + ExportMem,
+    E: RenderElement<R>,
+    <R as smithay::backend::renderer::RendererSuper>::TextureId: 'static,
+{
+    let (w, h) = (size.w, size.h);
+    let mut buffer = Offscreen::<B>::create_buffer(renderer, Fourcc::Argb8888, Size::from((w, h)))
+        .map_err(|e| capture_err("离屏缓冲创建失败", e))?;
+    let mut target = renderer.bind(&mut buffer).map_err(|e| capture_err("绑定失败", e))?;
+    let mut frame = renderer.render(&mut target, size, Transform::Normal)
+        .map_err(|e| capture_err("开始渲染失败", e))?;
+    let clear = if transparent { Color32F::new(0.0, 0.0, 0.0, 0.0) }
+        else { Color32F::new(0.1, 0.1, 0.12, 1.0) };
+    frame.clear(clear, &[Rectangle::from_size(size)]).map_err(|e| capture_err("清屏失败", e))?;
+    draw_render_elements(&mut frame, 1.0f64, elements, &[Rectangle::from_size(size)])
+        .map_err(|e| capture_err("渲染元素失败", e))?;
+    let _sync = frame.finish().map_err(|e| capture_err("帧完成失败", e))?;
+    let mapping = renderer.copy_framebuffer(&target, Rectangle::from_size(Size::<i32, Buffer>::from((w, h))), Fourcc::Argb8888)
+        .map_err(|e| capture_err("读回像素失败", e))?;
+    let data = renderer.map_texture(&mapping).map_err(|e| capture_err("映射失败", e))?.to_vec();
+    Ok(RawFrame { width: w, height: h, data })
 }
 
 /// 截图管线错误统一封装。

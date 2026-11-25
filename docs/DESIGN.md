@@ -348,9 +348,9 @@ $ DISPLAY=:100 xterm &                     # X11 应用
 |---|---|
 | 传输边界 | UDS only，socket 0600，目录 `$XDG_RUNTIME_DIR/agentdesk/` 0700；默认同用户可信 |
 | 鉴权 | 可选 `--token <t>`：首条消息必须为 `auth`，否则连接关闭 |
-| 进程拉起 | `windows.launch` 默认允许（本合成器本就为 Agent 而建）；提供 `--deny-launch` 与 `--launch-allowlist FILE` 收紧 |
-| 资源限制 | 最大连接 64；单条消息 ≤ 64 MiB；单次截图 ≤ 输出尺寸 ×4；订阅类型白名单 |
-| 文件写入 | `to_path` 仅允许绝对路径，且受 `--capture-output-dir` 白名单约束（默认允许所有路径，沙箱部署时收紧） |
+| 进程拉起 | `windows.launch` 默认允许（本合成器本就为 Agent 而建）；`--deny-launch` 全局禁用；`--launch-allowlist FILE` 限定可执行文件（两种限制同时设置时 deny 优先） |
+| 资源限制 | 最大连接 64；单条消息 ≤ 64 MiB；单次截图 raw ≤ 45 MiB（留 JSON/base64 头部空间）；事件订阅类型白名单、最多 16 项；帧订阅最多一个/连接、fps ≤ 30 且慢客户端单槽合并 |
+| 文件写入 | `to_path` 仅允许绝对路径；通过目录 fd 锚定 + `openat(O_NOFOLLOW)` + 临时文件原子 rename 防 TOCTOU/符号链接逃逸；可用 `--capture-output-dir` 限制根目录（文件模式 0600） |
 | 威胁模型 | 连上 socket ≈ 拿到用户级输入/观察能力（等同键盘+截屏权限），因此不向同用户之外暴露任何网络接口 |
 
 沙箱化 Agent（容器/namespace）部署：把 socket 挂进沙箱即可，不需要其他共享。
@@ -453,8 +453,8 @@ M0–M5 已实现并验证（e2e 5 项 + 单元测试 5 项全绿）。与上文
 - ✅ M3 截图（screen/window × png/jpeg/raw × base64/file）
 - ✅ M4 嵌套查看器（show/hide/status、父会话镜像、崩溃隔离、30Hz 推帧）
 - ✅ M5 windows.launch（非阻塞等待）、layout.tile/cascade、outputs.create/destroy、xwayland-satellite 编排、x11.status
-- ⏳ M5b 剪贴板 set/get（smithay DataDevice/PrimarySelection 接线）
-- ⏳ M6 glow 渲染器、via_fd、frames.subscribe、安全加固（--deny-launch 等）
+- ✅ M5b 剪贴板：set 发布到 DataDevice/PrimarySelection；get 对客户端 selection 走工作线程 fd 读取（2 秒超时），不阻塞主循环
+- 🟨 M6 via_fd、`--deny-launch` / `--launch-allowlist`、`--capture-output-dir`（fd 锚定、openat no-follow、原子 rename）均已实现并测试；§11 安全模型各项已有代码路径，新增验证覆盖 token 三次失败断连、事件订阅白名单、截图 45 MiB 资源上限；Glow surfaceless EGL 离屏整屏/单窗口截图管线已接入（真实 Wayland 客户端窗口像素 e2e 已验证）；`frames.subscribe/unsubscribe` 已按 fps 推送 JPEG/base64 帧并测试；`auto` 仍默认 Pixman
 
 ### 16.4 已验证清单（e2e，`cargo test --workspace -- --test-threads=1`）
 
@@ -463,3 +463,4 @@ M0–M5 已实现并验证（e2e 5 项 + 单元测试 5 项全绿）。与上文
 3. 截图：整屏/单窗口像素断言（红→绿证明注入与渲染一致）、png/jpeg 编码
 4. launch/布局/输出：launch 等窗返回 window_id、网格几何精确断言、outputs 增删
 5. server.info / display.show 的 no_parent_session 分支
+6. clipboard.set/get：合成器发布内容回读 + 测试客户端发布 selection 后的异步读取
